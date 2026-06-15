@@ -1,0 +1,26 @@
+.env
+.DS_Store
+.tmp/
+
+# Compiled Go binaries emitted by "go build"
+*.exe
+*.test
+*.out
+
+# Local scratch files
+*.tmp
+
+# Go workspace files (local development only, never committed)
+go.work
+go.work.sum
+
+# Editor and local tool state
+.idea/
+.vscode/
+.claude/
+.claude/settings.local.json
+
+# Documentation site build output and dependencies
+docs/node_modules/
+docs/dist/
+docs/.astro/

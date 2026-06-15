@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [transaction, eventbus, outbox, outbox/gowaymigrator, transaction/integration]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -count=1
+
+  zero-dependency-core:
+    name: zero-dependency core (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [transaction, eventbus]
+    steps:
+      - uses: actions/checkout@v4
+      - name: assert go.mod has no require directive
+        run: |
+          if grep -qE '^[[:space:]]*require' "${{ matrix.module }}/go.mod"; then
+            echo "::error::${{ matrix.module }}/go.mod must have no require directive (zero-dependency core)"
+            exit 1
+          fi
+          echo "${{ matrix.module }}: zero-dependency core OK"
+
+  goway-isolation:
+    name: goway confined to the adapter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: outbox core must not reference goway
+        run: |
+          if grep -q 'github.com/cgardev/goway' outbox/go.mod; then
+            echo "::error::outbox/go.mod must not reference goway; it belongs only in outbox/gowaymigrator"
+            exit 1
+          fi
+          echo "outbox core: no goway OK"
+      - name: adapter must require goway
+        run: |
+          if ! grep -q 'github.com/cgardev/goway' outbox/gowaymigrator/go.mod; then
+            echo "::error::outbox/gowaymigrator/go.mod must require goway"
+            exit 1
+          fi
+          echo "goway isolation OK"
+
+  integration:
+    name: integration (postgres + sqlite)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [transaction/integration, outbox]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+      - run: go test -tags=integration ./... -count=1
