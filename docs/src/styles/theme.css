@@ -1,0 +1,110 @@
+/*
+ * Monochrome palette for the Starlight "Ion" theme.
+ *
+ * The Ion theme provides the layout and components; this file recolors it to a
+ * clean black-and-white palette by overriding Starlight's --sl-color-* custom
+ * properties, which Ion also reads.
+ *
+ * Selectors use a doubled :root so these declarations outrank both Starlight's
+ * defaults and Ion's stylesheet (which Starlight loads after this file),
+ * regardless of source order:
+ *   :root:root                      -> dark mode (the default)
+ *   :root:root[data-theme='light']  -> light mode (higher specificity, wins)
+ * Both blocks define the same token set, so no value leaks between modes.
+ *
+ * Palette: light  bg #ffffff, text #0d0d0d, muted #676767, border #e5e5e5,
+ *                 surface #f7f7f8, accent near-black.
+ *          dark   bg #0d0d0d, text #ececec, muted #a1a1a1, border #2f2f2f,
+ *                 surface #171717, accent near-white.
+ */
+
+/* Dark mode (default) */
+:root:root {
+	/* Base palette */
+	--sl-color-white: #ececec;
+	--sl-color-gray-1: #ececec;
+	--sl-color-gray-2: #c5c5d2;
+	--sl-color-gray-3: #a1a1a1;
+	--sl-color-gray-4: #8e8e8e;
+	--sl-color-gray-5: #2f2f2f;
+	--sl-color-gray-6: #171717;
+	--sl-color-black: #0d0d0d;
+
+	/* Neutral accent: links and the active item read as bright ink. */
+	--sl-color-accent-low: #2f2f2f;
+	--sl-color-accent: #b4b4b4;
+	--sl-color-accent-high: #ffffff;
+
+	/* Surfaces and borders for the dark scheme. */
+	--sl-color-bg: #0d0d0d;
+	--sl-color-bg-nav: #0d0d0d;
+	--sl-color-bg-sidebar: #0d0d0d;
+	--sl-color-bg-inline-code: #171717;
+	--sl-color-hairline: #2f2f2f;
+	--sl-color-hairline-light: #2f2f2f;
+	--sl-color-hairline-shade: #000000;
+	--sl-color-text: #ececec;
+	--sl-color-text-accent: #ffffff;
+}
+
+/* Light mode */
+:root:root[data-theme='light'] {
+	/* Base palette (inverted: gray-1 is the darkest ink in light mode) */
+	--sl-color-white: #0d0d0d;
+	--sl-color-gray-1: #0d0d0d;
+	--sl-color-gray-2: #1a1a1a;
+	--sl-color-gray-3: #676767;
+	--sl-color-gray-4: #8e8e8e;
+	--sl-color-gray-5: #e5e5e5;
+	--sl-color-gray-6: #f7f7f8;
+	--sl-color-gray-7: #f7f7f8;
+	--sl-color-black: #ffffff;
+
+	/* Neutral accent: links and the active item read as near-black ink. */
+	--sl-color-accent-low: #e5e5e5;
+	--sl-color-accent: #676767;
+	--sl-color-accent-high: #0d0d0d;
+
+	/* Surfaces and borders for the light scheme. */
+	--sl-color-bg: #ffffff;
+	--sl-color-bg-nav: #ffffff;
+	--sl-color-bg-sidebar: #ffffff;
+	--sl-color-bg-inline-code: #f7f7f8;
+	--sl-color-hairline: #e5e5e5;
+	--sl-color-hairline-light: #ececec;
+	--sl-color-hairline-shade: #e5e5e5;
+	--sl-color-text: #0d0d0d;
+	--sl-color-text-accent: #0d0d0d;
+}
+
+/*
+ * Home (splash) page width.
+ *
+ * On the splash template Starlight stretches the content to the full viewport,
+ * which reads as too wide on large screens. The splash .sl-container carries
+ * max-width: 100% !important, so it cannot be narrowed cleanly; instead each
+ * content block is capped to a centered column directly: the hero and the
+ * markdown body. (The landing page disables the edit link and prev/next
+ * pagination in its frontmatter, so there is no footer to constrain.) Scoped to
+ * pages with a hero (data-has-hero, set by Starlight on the splash page), so the
+ * documentation pages keep their normal width.
+ */
+[data-has-hero] {
+	--sl-content-width: 60rem;
+}
+
+[data-has-hero] .hero,
+[data-has-hero] .sl-markdown-content {
+	max-width: 60rem;
+	margin-inline: auto;
+}
+
+/*
+ * The landing page disables the edit link and prev/next pagination in its
+ * frontmatter, which leaves an empty page footer whose top border still spans
+ * the full width. Hide that empty footer on hero pages so nothing stretches
+ * edge-to-edge below the content.
+ */
+[data-has-hero] .content-panel > footer {
+	display: none;
+}
