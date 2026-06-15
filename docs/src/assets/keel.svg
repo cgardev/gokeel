@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="gokeel">
+  <!--
+    A hull cross-section: two nested frames over the keel, a keel fin, and a
+    bulb. The ink colour follows the operating system colour scheme so the mark
+    stays crisp on the monochrome light and dark palettes.
+  -->
+  <style>
+    svg { --keel: #0d0d0d; }
+    @media (prefers-color-scheme: dark) {
+      svg { --keel: #ececec; }
+    }
+  </style>
+  <g fill="none" stroke="var(--keel)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M13 14 Q 13 42 32 42 Q 51 42 51 14" />
+    <path d="M22 18 Q 22 36 32 36 Q 42 36 42 18" />
+    <line x1="32" y1="42" x2="32" y2="52" />
+  </g>
+  <circle cx="32" cy="54.5" r="3" fill="var(--keel)" />
+</svg>

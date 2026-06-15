@@ -38,15 +38,18 @@ export default defineConfig({
 				}),
 			],
 			customCss: ['./src/styles/theme.css'],
-			// The header logo and the browser tab icon both use the file
-			// artwork. The logo is resolved relative to the project root, while the
-			// favicon is served from the public directory.
+			// The header logo and the browser tab icon both use the keel artwork.
+			// The header logo ships as two fixed-colour files so it tracks the
+			// Starlight theme toggle exactly; the favicon is a single file that
+			// follows the operating system colour scheme. Both are served from the
+			// project: the logos relative to the root, the favicon from public/.
 			logo: {
-				src: './src/assets/sql-file.png',
+				light: './src/assets/keel-light.svg',
+				dark: './src/assets/keel-dark.svg',
 				alt: 'gokeel',
 				replacesTitle: false,
 			},
-			favicon: '/sql-file.png',
+			favicon: '/keel.svg',
 			social: [
 				{
 					icon: 'github',
