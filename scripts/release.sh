@@ -4,8 +4,8 @@
 # tagged at the same version, so one number identifies the entire family.
 #
 # Because Go requires one tag per module subdirectory, a release of v0.3.0 creates
-# the tags transaction/v0.3.0, eventbus/v0.3.0, logging/v0.3.0, outbox/v0.3.0 and
-# outbox/gowaymigrator/v0.3.0.
+# the tags transaction/v0.3.0, eventbus/v0.3.0, logging/v0.3.0,
+# configuration/v0.3.0, outbox/v0.3.0 and outbox/gowaymigrator/v0.3.0.
 #
 # Usage: scripts/release.sh v0.3.0
 set -euo pipefail
@@ -27,11 +27,12 @@ fi
 remote="${REMOTE:-origin}"
 
 # 1) Tag the zero-dependency leaves first. They have nothing to coordinate.
-echo "==> tagging leaves transaction/$V, eventbus/$V and logging/$V"
+echo "==> tagging leaves transaction/$V, eventbus/$V, logging/$V and configuration/$V"
 git tag "transaction/$V"
 git tag "eventbus/$V"
 git tag "logging/$V"
-git push "$remote" "transaction/$V" "eventbus/$V" "logging/$V"
+git tag "configuration/$V"
+git push "$remote" "transaction/$V" "eventbus/$V" "logging/$V" "configuration/$V"
 
 # 2) Point outbox at the freshly tagged leaves: drop the local replaces and pin
 #    the published versions, then refresh go.sum. Commit and tag outbox.
@@ -94,4 +95,4 @@ echo "==> restoring development replaces"
 git commit -am "post-release: restore development replaces"
 git push "$remote" HEAD
 
-echo "==> released gokeel $V (transaction/$V, eventbus/$V, logging/$V, outbox/$V, outbox/gowaymigrator/$V)"
+echo "==> released gokeel $V (transaction/$V, eventbus/$V, logging/$V, configuration/$V, outbox/$V, outbox/gowaymigrator/$V)"
