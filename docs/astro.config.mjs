@@ -16,6 +16,18 @@ export default defineConfig({
 			title: 'gokeel',
 			description:
 				'Building blocks for a modular monolith in Go: a declarative transaction manager, an in-process event bus, a transactional outbox, hierarchical log-level management, and externalized configuration.',
+			// Internationalization. English is the root locale, so the canonical
+			// pages keep their current URLs (/gokeel/guides/...), and every
+			// translation lives under a locale directory that mirrors the English
+			// tree (src/content/docs/es/guides/... served at /gokeel/es/...).
+			// A page that has no translation yet automatically falls back to the
+			// English content, with a notice and the language picker, so locales
+			// can be translated page by page. See README.md for the workflow.
+			defaultLocale: 'root',
+			locales: {
+				root: { label: 'English', lang: 'en' },
+				es: { label: 'Español', lang: 'es' },
+			},
 			// Apply the Ion theme, recolored with the monochrome
 			// palette defined in ./src/styles/theme.css. useCustomECTheme:false lets
 			// code blocks follow the same palette instead of Ion's built-in theme.

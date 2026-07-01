@@ -1,49 +1,88 @@
-# Starlight Starter Kit: Basics
+# gokeel documentation site
 
-[![Built with Starlight](https://astro.badg.es/v2/built-with-starlight/tiny.svg)](https://starlight.astro.build)
+The documentation site for [gokeel](https://github.com/cgardev/gokeel), built
+with [Astro](https://docs.astro.build) and
+[Starlight](https://starlight.astro.build) and published as a GitHub Pages
+project site at <https://cgardev.github.io/gokeel/>.
 
-```
-pnpm create astro@latest -- --template starlight
-```
-
-> 🧑‍🚀 **Seasoned astronaut?** Delete this file. Have fun!
-
-## 🚀 Project Structure
-
-Inside of your Astro + Starlight project, you'll see the following folders and files:
+## Project structure
 
 ```
-.
-├── public/
+docs/
+├── public/                     Static assets served as-is (favicon).
 ├── src/
-│   ├── assets/
+│   ├── assets/                 Images imported by pages (header logos).
 │   ├── content/
-│   │   └── docs/
-│   └── content.config.ts
-├── astro.config.mjs
-├── package.json
-└── tsconfig.json
+│   │   └── docs/               The English pages — the canonical content.
+│   │       ├── index.mdx       Landing page.
+│   │       ├── getting-started.md
+│   │       ├── guides/         One guide per module or concern.
+│   │       ├── reference/      One reference page per module.
+│   │       ├── cookbook/       Task-oriented recipes.
+│   │       └── es/             Spanish translations (mirrors the tree above).
+│   ├── content.config.ts       Content collection wiring for Starlight.
+│   └── styles/                 The monochrome palette over the Ion theme.
+├── astro.config.mjs            Site, sidebar, locales, and plugin configuration.
+└── package.json
 ```
 
-Starlight looks for `.md` or `.mdx` files in the `src/content/docs/` directory. Each file is exposed as a route based on its file name.
+Every `.md` or `.mdx` file under `src/content/docs/` becomes a route based on
+its path. The sidebar is declared explicitly in `astro.config.mjs`, so a new
+page must also be added there.
 
-Images can be added to `src/assets/` and embedded in Markdown with a relative link.
+## Translations
 
-Static assets, like favicons, can be placed in the `public/` directory.
+The site is configured for page-by-page translation. English is the **root
+locale**: the canonical pages live directly under `src/content/docs/` and keep
+their URLs (`/gokeel/guides/event-bus/`). Each additional language is declared
+in the `locales` map of `astro.config.mjs` and lives in a directory named after
+its BCP-47 tag, mirroring the English tree exactly:
 
-## 🧞 Commands
+```
+src/content/docs/guides/event-bus.md        →  /gokeel/guides/event-bus/
+src/content/docs/es/guides/event-bus.md     →  /gokeel/es/guides/event-bus/
+```
 
-All commands are run from the root of the project, from a terminal:
+The rules of the workflow:
 
-| Command                   | Action                                           |
-| :------------------------ | :----------------------------------------------- |
-| `pnpm install`             | Installs dependencies                            |
-| `pnpm dev`             | Starts local dev server at `localhost:4321`      |
-| `pnpm build`           | Build your production site to `./dist/`          |
-| `pnpm preview`         | Preview your build locally, before deploying     |
-| `pnpm astro ...`       | Run CLI commands like `astro add`, `astro check` |
-| `pnpm astro -- --help` | Get help using the Astro CLI                     |
+- **Translate one page at a time.** A page with no translation in a locale
+  automatically falls back to the English content, shown with a
+  "not yet translated" notice and the language picker, so a locale never
+  breaks the build by being incomplete.
+- **Never change file names or paths.** The path relative to the locale
+  directory is the page's identity; renaming it creates a different page
+  instead of a translation.
+- **Translate frontmatter values, not keys.** `title` and `description` are
+  translated; the field names and any slugs stay as they are.
+- **Adjust internal links to the locale.** A translated page links to its
+  siblings under the locale path (`/gokeel/es/guides/...`), falling back to
+  the English path only for pages that intentionally have no translation.
+- **Code blocks stay in English.** Identifiers, comments, and output in code
+  samples follow the repository's English-only code standard; only the prose
+  around them is translated.
+- **Sidebar labels** are translated in `astro.config.mjs` by adding a
+  `translations` map next to each `label`, for example
+  `{ label: 'Guides', translations: { es: 'Guías' } }`. Starlight ships its
+  own user-interface strings (search, table of contents, the fallback notice)
+  for the configured languages, so those need no work.
 
-## 👀 Want to learn more?
+To add a new language, declare it in the `locales` map and create its
+directory under `src/content/docs/`; everything else follows from the rules
+above.
 
-Check out [Starlight’s docs](https://starlight.astro.build/), read [the Astro documentation](https://docs.astro.build), or jump into the [Astro Discord server](https://astro.build/chat).
+Machine-assisted translations follow
+[`TRANSLATION_PROMPT.md`](TRANSLATION_PROMPT.md): point an agent (for
+example the Gemini CLI) at that file and name the pages to translate, and it
+reads the sources, writes the translated files into the locale tree, and
+verifies the build. Its output is a draft that a human reviews page by page.
+
+## Commands
+
+All commands run from the `docs/` directory:
+
+| Command        | Action                                             |
+| :------------- | :------------------------------------------------- |
+| `pnpm install` | Install dependencies.                               |
+| `pnpm dev`     | Start the local development server.                 |
+| `pnpm build`   | Build the production site into `./dist/`.           |
+| `pnpm preview` | Preview the production build locally.               |
