@@ -7,9 +7,9 @@
 The keel of a ship is the first structural piece laid down and the spine the
 rest of the hull is built on. **gokeel** is the same idea for a Go application:
 a small family of building blocks for a modular monolith — declarative
-transactions, an in-process event bus, and a transactional outbox — drawn from
-the patterns Spring and Spring Modulith made familiar, with a standard-library
-core.
+transactions, an in-process event bus, a transactional outbox, and hierarchical
+log-level management — drawn from the patterns Spring and Spring Modulith made
+familiar, with a standard-library core.
 
 > **Alpha.** The API may still change and there are no tagged releases yet. Pin a
 > specific commit when depending on a module.
@@ -24,11 +24,12 @@ the part you import.
 | --- | --- | --- | --- |
 | **transaction** | `github.com/cgardev/gokeel/transaction` | A context-bound, declarative transaction manager over `database/sql` with Spring-style propagation and commit synchronizations. | **None** — standard library only. |
 | **eventbus** | `github.com/cgardev/gokeel/eventbus` | A small, synchronous, in-process event bus with per-listener delivery. | **None** — standard library only. |
+| **logging** | `github.com/cgardev/gokeel/logging` | Spring Boot-style hierarchical log levels for `log/slog`: per-package and per-type levels, externally overridable and adjustable at runtime. | **None** — standard library only. |
 | **outbox** | `github.com/cgardev/gokeel/outbox` | The transactional outbox pattern as an in-process event publication registry: events are written in the producing transaction and delivered after commit. | `transaction`, `eventbus`, `google/uuid`. |
 
-`transaction` and `eventbus` are leaves: each is its own module with a `go.mod`
-that has **no `require` directive at all**, a property enforced in CI. `outbox`
-sits on top and composes the other two.
+`transaction`, `eventbus`, and `logging` are leaves: each is its own module with
+a `go.mod` that has **no `require` directive at all**, a property enforced in
+CI. `outbox` sits on top and composes `transaction` and `eventbus`.
 
 ### Schema migrations
 
@@ -57,6 +58,7 @@ alternative engine reuses the exact SQL.
 ```sh
 go get github.com/cgardev/gokeel/transaction
 go get github.com/cgardev/gokeel/eventbus
+go get github.com/cgardev/gokeel/logging
 go get github.com/cgardev/gokeel/outbox
 ```
 
@@ -96,8 +98,9 @@ The modules are released **in lockstep**: every release tags all of them at the
 same version, so a single number identifies the whole family and any
 `gokeel/transaction@vX.Y.Z` is always compatible with `gokeel/outbox@vX.Y.Z`.
 Because Go requires one tag per module subdirectory, a release of `v0.3.0`
-creates the tags `transaction/v0.3.0`, `eventbus/v0.3.0`, `outbox/v0.3.0`, and
-`outbox/gowaymigrator/v0.3.0`. See [`scripts/release.sh`](scripts/release.sh).
+creates the tags `transaction/v0.3.0`, `eventbus/v0.3.0`, `logging/v0.3.0`,
+`outbox/v0.3.0`, and `outbox/gowaymigrator/v0.3.0`. See
+[`scripts/release.sh`](scripts/release.sh).
 
 ## Status and roadmap
 
@@ -107,6 +110,8 @@ creates the tags `transaction/v0.3.0`, `eventbus/v0.3.0`, `outbox/v0.3.0`, and
   isolation and read-only options, timeouts, rollback rules, and before-commit /
   after-commit / after-completion synchronizations.
 - `eventbus`: typed registration, ordered synchronous delivery, panic isolation.
+- `logging`: hierarchical per-package and per-type log levels over `log/slog`,
+  external configuration documents, logger groups, and runtime adjustment.
 - `outbox`: outbox store over PostgreSQL and SQLite, after-commit publication,
   and a resubmitter for unfinished entries.
 

@@ -19,6 +19,8 @@ so that the core libraries stay free of external dependencies.
   application supplies the driver.
 - `eventbus` — the in-process event bus. Its `go.mod` also has no `require`
   directive.
+- `logging` — hierarchical log-level management for `log/slog`. Its `go.mod`
+  also has no `require` directive.
 - `outbox` — the transactional outbox. It composes `transaction` and `eventbus`
   and additionally depends on `github.com/google/uuid`. By default it applies its
   schema with the standard library alone (a built-in `NativeMigrator`).
@@ -40,7 +42,7 @@ tagged release.
 Run the static checks and tests for each module:
 
 ```sh
-for module in transaction eventbus outbox outbox/gowaymigrator transaction/integration; do
+for module in transaction eventbus logging outbox outbox/gowaymigrator transaction/integration; do
   go -C "$module" build ./...
   go -C "$module" vet ./...
   go -C "$module" test ./... -count=1
@@ -61,7 +63,8 @@ go -C outbox test -tags=integration ./... -count=1
 - Format all code with `gofmt`.
 - Document every exported identifier with a complete sentence that begins with
   the identifier name.
-- Keep the `transaction` and `eventbus` modules free of external dependencies.
+- Keep the `transaction`, `eventbus`, and `logging` modules free of external
+  dependencies.
 - Write clear, self-documenting code, and add comments only where the logic is
   not self-evident.
 - Use technical, impersonal English in comments and documentation.

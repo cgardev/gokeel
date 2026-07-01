@@ -15,7 +15,7 @@ export default defineConfig({
 		starlight({
 			title: 'gokeel',
 			description:
-				'Building blocks for a modular monolith in Go: a declarative transaction manager, an in-process event bus, and a transactional outbox.',
+				'Building blocks for a modular monolith in Go: a declarative transaction manager, an in-process event bus, a transactional outbox, and hierarchical log-level management.',
 			// Apply the Ion theme, recolored with the monochrome
 			// palette defined in ./src/styles/theme.css. useCustomECTheme:false lets
 			// code blocks follow the same palette instead of Ion's built-in theme.
@@ -34,7 +34,7 @@ export default defineConfig({
 				starlightLlmsTxt({
 					projectName: 'gokeel',
 					description:
-						'Building blocks for a modular monolith in Go, inspired by Spring and Spring Modulith: a context-bound declarative transaction manager with propagation and commit synchronizations, a synchronous in-process event bus, and a transactional outbox that publishes events after commit. The transaction and eventbus cores depend only on the Go standard library; the outbox adds a pluggable schema migrator.',
+						'Building blocks for a modular monolith in Go, inspired by Spring and Spring Modulith: a context-bound declarative transaction manager with propagation and commit synchronizations, a synchronous in-process event bus, a transactional outbox that publishes events after commit, and hierarchical log-level management over log/slog. The transaction, eventbus, and logging cores depend only on the Go standard library; the outbox adds a pluggable schema migrator.',
 				}),
 			],
 			customCss: ['./src/styles/theme.css'],
