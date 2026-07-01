@@ -73,9 +73,11 @@ func TestCompetingListenerHandlesEachEventExactlyOnceAcrossNodes(t *testing.T) {
 		defer mu.Unlock()
 		return len(handled) == published
 	})
-	// A duplicate would arrive shortly after the first delivery; give the
-	// cluster a moment to produce one before asserting exactly-once.
-	time.Sleep(100 * time.Millisecond)
+	// Once every delivery row is completed, the claim guards forbid any
+	// further handler invocation, so the counts below are final.
+	waitFor(t, 10*time.Second, "every delivery settles as completed", func() bool {
+		return countDeliveriesWithStatus(t, first.database, StatusCompleted) == published
+	})
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -111,7 +113,10 @@ func TestBroadcastListenerHandlesEachEventOncePerNode(t *testing.T) {
 	waitFor(t, 10*time.Second, "both nodes deliver every event", func() bool {
 		return firstReceived.count() == published && secondReceived.count() == published
 	})
-	time.Sleep(100 * time.Millisecond)
+	// One completed delivery row per message and node makes the counts final.
+	waitFor(t, 10*time.Second, "every delivery settles as completed", func() bool {
+		return countDeliveriesWithStatus(t, first.database, StatusCompleted) == 2*published
+	})
 	if firstReceived.count() != published || secondReceived.count() != published {
 		t.Errorf("deliveries first=%d second=%d, want %d on each node",
 			firstReceived.count(), secondReceived.count(), published)
@@ -136,6 +141,13 @@ func TestWakeSignalTriggersAnImmediatePass(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if err := publisherNode.publish(t.Context(), orderPlaced{OrderID: "o-1"}); err != nil {
 		t.Fatalf("publish: %v", err)
+	}
+
+	// Without a wake signal the next pass is an hour away: the event must
+	// still be undelivered, or the assertion below would pass vacuously.
+	time.Sleep(200 * time.Millisecond)
+	if received.count() != 0 {
+		t.Fatal("the event was delivered before the wake signal; the poll interval did not isolate the wake path")
 	}
 	wake <- struct{}{}
 
@@ -163,17 +175,17 @@ func TestMaterializationDoesNotReplayHistoryFromBeforeAttachment(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 
-	waitFor(t, 5*time.Second, "the fresh event is delivered", func() bool {
-		return received.count() >= 1
+	waitFor(t, 5*time.Second, "the fresh event is delivered and settled", func() bool {
+		return received.count() >= 1 &&
+			countDeliveriesWithStatus(t, listenerNode.database, StatusCompleted) == 1
 	})
-	time.Sleep(100 * time.Millisecond)
 	for _, event := range received.snapshot() {
 		if event.OrderID == "before-attachment" {
 			t.Error("an event published before the attachment boundary was replayed")
 		}
 	}
-	if received.count() != 1 {
-		t.Errorf("delivered events = %d, want 1", received.count())
+	if got := countRows(t, listenerNode.database, deliveryTableName); got != 1 {
+		t.Errorf("delivery rows = %d, want 1 (history must not be materialized)", got)
 	}
 }
 
@@ -236,5 +248,139 @@ func TestBroadcastConsumerOfADeadNodeExpires(t *testing.T) {
 	})
 	if got := countRows(t, survivor.database, consumerTableName); got != 1 {
 		t.Errorf("consumer rows after expiry = %d, want only the survivor's competing registration", got)
+	}
+}
+
+func TestAnotherNodeStealsAnExpiredClaim(t *testing.T) {
+	path := newSQLitePath(t)
+	lease := WithLeaseDuration(100 * time.Millisecond)
+	stalled := newSQLiteNode(t, path, lease)
+	rescuer := newSQLiteNode(t, path, lease)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	err := AttachCompetingListener(t.Context(), stalled.bridge, "billing",
+		func(ctx context.Context, event orderPlaced) error {
+			close(started)
+			<-release
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("attach billing on the stalled node: %v", err)
+	}
+	var rescued recorder
+	if err := AttachCompetingListener(t.Context(), rescuer.bridge, "billing", rescued.handle); err != nil {
+		t.Fatalf("attach billing on the rescuing node: %v", err)
+	}
+
+	// The asynchronous publisher claims the pre-created delivery on the
+	// stalled node, whose listener then hangs past the claim lease. The
+	// rescuing dispatcher starts only once that claim is held, so the steal
+	// path is the only way the event can complete.
+	if err := stalled.manager.Run(t.Context(), func(ctx context.Context) error {
+		return stalled.publisher.WithAsynchronousDispatch().Publish(ctx, orderPlaced{OrderID: "o-1"})
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stalled node never claimed its local delivery")
+	}
+	startDispatcher(t, NewDispatcher(rescuer.bridge, WithPollInterval(10*time.Millisecond)))
+
+	waitFor(t, 5*time.Second, "the rescuing node steals the expired claim and completes", func() bool {
+		return rescued.count() == 1 &&
+			countDeliveriesWithStatus(t, rescuer.database, StatusCompleted) == 1
+	})
+
+	// Releasing the stalled listener lets its zombie settlement run; the
+	// claim-token fence must discard it without reverting the completion.
+	close(release)
+	time.Sleep(100 * time.Millisecond)
+	status, attempts, _ := readSingleDeliveryState(t, rescuer.database)
+	if status != StatusCompleted {
+		t.Fatalf("delivery status after the zombie settlement = %s, want COMPLETED", status)
+	}
+	if attempts != 2 {
+		t.Errorf("recorded attempts = %d, want 2 (original claim and steal)", attempts)
+	}
+}
+
+func TestFrontierAndDeliveriesSurviveANodeRestart(t *testing.T) {
+	path := newSQLitePath(t)
+	publisherNode := newSQLiteNode(t, path)
+
+	firstIncarnation := newSQLiteNode(t, path)
+	var beforeRestart recorder
+	if err := AttachCompetingListener(t.Context(), firstIncarnation.bridge, "billing", beforeRestart.handle); err != nil {
+		t.Fatalf("attach billing before the restart: %v", err)
+	}
+	stop := NewDispatcher(firstIncarnation.bridge, WithPollInterval(10*time.Millisecond)).Start()
+	if err := publisherNode.publish(t.Context(), orderPlaced{OrderID: "before-restart"}); err != nil {
+		t.Fatalf("publish before the restart: %v", err)
+	}
+	waitFor(t, 5*time.Second, "the first incarnation delivers and settles", func() bool {
+		return beforeRestart.count() == 1 &&
+			countDeliveriesWithStatus(t, publisherNode.database, StatusCompleted) == 1
+	})
+	stop()
+
+	// The restarted node re-attaches the same durable competing group; the
+	// completed delivery row and the stored frontier must prevent any replay.
+	secondIncarnation := newSQLiteNode(t, path)
+	var afterRestart recorder
+	if err := AttachCompetingListener(t.Context(), secondIncarnation.bridge, "billing", afterRestart.handle); err != nil {
+		t.Fatalf("attach billing after the restart: %v", err)
+	}
+	startDispatcher(t, NewDispatcher(secondIncarnation.bridge, WithPollInterval(10*time.Millisecond)))
+
+	if err := publisherNode.publish(t.Context(), orderPlaced{OrderID: "after-restart"}); err != nil {
+		t.Fatalf("publish after the restart: %v", err)
+	}
+	waitFor(t, 5*time.Second, "the second incarnation delivers the fresh event", func() bool {
+		return afterRestart.count() >= 1 &&
+			countDeliveriesWithStatus(t, publisherNode.database, StatusCompleted) == 2
+	})
+	for _, event := range afterRestart.snapshot() {
+		if event.OrderID == "before-restart" {
+			t.Error("the restarted node replayed an event its previous incarnation had completed")
+		}
+	}
+	if got := countRows(t, publisherNode.database, deliveryTableName); got != 2 {
+		t.Errorf("delivery rows = %d, want 2", got)
+	}
+}
+
+func TestListenersReceiveOnlyTheirEventType(t *testing.T) {
+	path := newSQLitePath(t)
+	publisherNode := newSQLiteNode(t, path)
+	listenerNode := newSQLiteNode(t, path)
+
+	var received recorder
+	if err := AttachCompetingListener(t.Context(), listenerNode.bridge, "billing", received.handle); err != nil {
+		t.Fatalf("attach billing: %v", err)
+	}
+	startDispatcher(t, NewDispatcher(listenerNode.bridge, WithPollInterval(10*time.Millisecond)))
+
+	if err := publisherNode.publish(t.Context(), orderCancelled{OrderID: "c-1"}); err != nil {
+		t.Fatalf("publish the cancellation: %v", err)
+	}
+	if err := publisherNode.publish(t.Context(), orderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatalf("publish the placement: %v", err)
+	}
+
+	waitFor(t, 5*time.Second, "the placement is delivered and settled", func() bool {
+		return countDeliveriesWithStatus(t, listenerNode.database, StatusCompleted) == 1
+	})
+	events := received.snapshot()
+	if len(events) != 1 || events[0].OrderID != "o-1" {
+		t.Fatalf("listener received %+v, want only the placement o-1", events)
+	}
+	if got := countRows(t, listenerNode.database, deliveryTableName); got != 1 {
+		t.Errorf("delivery rows = %d, want 1 (the cancellation must not be materialized)", got)
+	}
+	if got := countRows(t, listenerNode.database, messageTableName); got != 2 {
+		t.Errorf("message rows = %d, want 2", got)
 	}
 }

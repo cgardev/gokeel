@@ -79,7 +79,11 @@ func testTimestampOrdering(t *testing.T, database *sql.DB) {
 	if err != nil {
 		t.Fatalf("select ordered publication dates: %v", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Logf("close rows: %v", err)
+		}
+	}()
 	var ordered []time.Time
 	for rows.Next() {
 		var raw string

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -18,6 +19,12 @@ const (
 	defaultMaterializationGrace = 10 * time.Minute
 	defaultInitialRetryDelay    = 5 * time.Second
 	defaultMaximumRetryDelay    = 5 * time.Minute
+
+	// settlementTimeout bounds the database call that settles a delivery
+	// outcome. Settlements run on a context that survives the caller's
+	// cancellation, so without a deadline a wedged database call could hold
+	// a stopping dispatcher forever.
+	settlementTimeout = 30 * time.Second
 )
 
 // EventBus is the slice of the in-process bus the bridge relies on. It is
@@ -56,6 +63,10 @@ type Bridge struct {
 
 	mu          sync.RWMutex
 	attachments []attachment
+	// subscribed remembers the local bus subscriptions this bridge created,
+	// so an Attach that failed after subscribing can be retried without
+	// tripping over its own leftover subscription.
+	subscribed map[eventbus.ListenerID]bool
 }
 
 // BridgeOption customizes a Bridge at construction time.
@@ -135,6 +146,7 @@ func NewBridge(store Store, bus EventBus, serializer Serializer, options ...Brid
 		leaseDuration:        defaultLeaseDuration,
 		materializationGrace: defaultMaterializationGrace,
 		retryDelay:           defaultRetryDelay,
+		subscribed:           make(map[eventbus.ListenerID]bool),
 	}
 	for _, option := range options {
 		option(bridge)
@@ -202,6 +214,16 @@ func attachListener[T any](
 		return fmt.Errorf("attach %s: %w", id, err)
 	}
 
+	bridge.mu.Lock()
+	for _, existing := range bridge.attachments {
+		if existing.id == id {
+			bridge.mu.Unlock()
+			return fmt.Errorf("%w: %s", eventbus.ErrDuplicateListener, id)
+		}
+	}
+	alreadySubscribed := bridge.subscribed[id]
+	bridge.mu.Unlock()
+
 	winner, err := bridge.store.RegisterListenerMode(ctx, id, mode)
 	if err != nil {
 		return err
@@ -213,21 +235,28 @@ func attachListener[T any](
 	// The local subscription comes before the durable consumer registration:
 	// a rejected subscription (for example, a duplicate identifier) is a
 	// deterministic programming error, and failing on it here leaves no
-	// durable row behind that would pin messages in retention.
-	err = bridge.bus.Subscribe(id,
-		func(event any) bool {
-			_, ok := event.(T)
-			return ok
-		},
-		func(ctx context.Context, event any) error {
-			typed, ok := event.(T)
-			if !ok {
-				return fmt.Errorf("listener %s received an event of unexpected type %T", id, event)
-			}
-			return handle(ctx, typed)
-		})
-	if err != nil {
-		return err
+	// durable row behind that would pin messages in retention. A subscription
+	// left over from an Attach that failed later is reused, so the attachment
+	// can be retried after a transient failure.
+	if !alreadySubscribed {
+		err = bridge.bus.Subscribe(id,
+			func(event any) bool {
+				_, ok := event.(T)
+				return ok
+			},
+			func(ctx context.Context, event any) error {
+				typed, ok := event.(T)
+				if !ok {
+					return fmt.Errorf("listener %s received an event of unexpected type %T", id, event)
+				}
+				return handle(ctx, typed)
+			})
+		if err != nil {
+			return err
+		}
+		bridge.mu.Lock()
+		bridge.subscribed[id] = true
+		bridge.mu.Unlock()
 	}
 
 	now := time.Now().UTC()
@@ -254,9 +283,10 @@ func attachListener[T any](
 // Detach removes the durable registrations of the listener, unpinning its
 // messages from retention. It is the decommissioning step for a listener
 // whose code was removed: call it after the last node hosting the listener
-// stopped, because a node that still hosts it re-registers the consumer on
-// its next heartbeat. The subscription on the local in-process bus remains
-// until the process restarts.
+// stopped, because a node that still hosts it — including this one, when its
+// Dispatcher is still running — re-registers the consumer on its next
+// heartbeat. The subscription on the local in-process bus remains until the
+// process restarts.
 func (b *Bridge) Detach(ctx context.Context, id eventbus.ListenerID) error {
 	if err := b.store.RemoveListener(ctx, id); err != nil {
 		return err
@@ -281,6 +311,14 @@ func (b *Bridge) Resubmit(ctx context.Context, key DeliveryKey) (bool, error) {
 	return b.store.ResubmitDelivery(ctx, key)
 }
 
+// FindExhausted returns the dead letters — deliveries that consumed their
+// attempt budget — oldest first, up to the limit. Each carries its message
+// and the last failure cause, so an operator can inspect them and revive one
+// with Resubmit.
+func (b *Bridge) FindExhausted(ctx context.Context, limit int) ([]DueDelivery, error) {
+	return b.store.FindExhaustedDeliveries(ctx, limit)
+}
+
 // Node returns the identity this bridge participates in the cluster under.
 func (b *Bridge) Node() NodeID {
 	return b.node
@@ -301,11 +339,17 @@ func (b *Bridge) snapshotAttachments() []attachment {
 	return snapshot
 }
 
-// publish stores the message and the pending delivery rows of the listeners
-// attached on this node through the caller's querier, so they join the
-// business transaction. Deliveries of listeners hosted on other nodes are
-// materialized there by their dispatchers.
-func (b *Bridge) publish(ctx context.Context, querier Querier, event any) (Message, []DeliveryKey, error) {
+// Publish stores the event as one message, together with the pending delivery
+// rows of the listeners attached on this node, through the provided querier —
+// so the rows join the caller's transaction. Deliveries of listeners hosted
+// on other nodes are materialized there by their dispatchers.
+//
+// Publish is the low-level seam for callers that manage their own
+// transactions; the stored deliveries are picked up by the dispatchers once
+// the transaction commits. Most callers use Publisher instead, which resolves
+// the querier from the active unit of work and dispatches the local
+// deliveries immediately after commit.
+func (b *Bridge) Publish(ctx context.Context, querier Querier, event any) (Message, []DeliveryKey, error) {
 	eventType, payload, err := b.serializer.Serialize(event)
 	if err != nil {
 		return Message{}, nil, err
@@ -370,10 +414,11 @@ func (b *Bridge) dispatchLocal(ctx context.Context, event any, keys []DeliveryKe
 
 // dispatchDelivery runs one delivery through the state machine: claim it
 // under a fresh token, restore the event, deliver through the local bus, and
-// settle the outcome. An unclaimable delivery is anothers dispatcher's work
-// and reports no error. Settlements run on a context that survives the
-// caller's cancellation, so a shutdown mid-delivery cannot strand a
-// processing row until its lease expires.
+// settle the outcome. An unclaimable delivery is another dispatcher's work
+// and reports no error. Settlements run on a bounded context that survives
+// the caller's cancellation, so a shutdown mid-delivery cannot strand a
+// processing row until its lease expires, and a wedged settlement cannot
+// hold a stopping dispatcher forever.
 func (b *Bridge) dispatchDelivery(
 	ctx context.Context,
 	key DeliveryKey,
@@ -390,25 +435,63 @@ func (b *Bridge) dispatchDelivery(
 		return nil
 	}
 
-	settleContext := context.WithoutCancel(ctx)
 	event, err := restore()
 	if err == nil {
-		err = b.bus.Deliver(ctx, key.ListenerID, event)
+		// The listener must finish within the claim lease; past it, another
+		// node may steal the claim, so running longer only produces work a
+		// zombie cannot settle.
+		deliveryContext, cancel := context.WithTimeout(ctx, b.leaseDuration)
+		err = b.bus.Deliver(deliveryContext, key.ListenerID, event)
+		cancel()
 	}
 	if err != nil {
 		deliveryError := fmt.Errorf("deliver %s to %s: %w", key.MessageID, key.ListenerID, err)
+		if ctx.Err() != nil {
+			// The caller is shutting down: the failure says nothing about the
+			// listener, so the attempt budget is not charged beyond the claim.
+			// The delivery stays processing and lease expiry recovers it.
+			return deliveryError
+		}
 		attempt := attemptsBeforeClaim + 1
 		nextAttemptDate := time.Now().UTC().Add(b.retryDelay(attempt))
-		if _, markError := b.store.FailDelivery(
+		settleContext, settleCancel := settlementContext(ctx)
+		defer settleCancel()
+		settled, markError := b.store.FailDelivery(
 			settleContext, key, token, err.Error(), nextAttemptDate, b.maximumAttempts,
-		); markError != nil {
+		)
+		if markError != nil {
 			return errors.Join(deliveryError, markError)
+		}
+		if !settled {
+			b.reportFencedSettlement(key)
 		}
 		return deliveryError
 	}
 
-	if _, err := b.store.CompleteDelivery(settleContext, key, token, time.Now().UTC()); err != nil {
+	settleContext, settleCancel := settlementContext(ctx)
+	defer settleCancel()
+	settled, err := b.store.CompleteDelivery(settleContext, key, token, time.Now().UTC())
+	if err != nil {
 		return err
 	}
+	if !settled {
+		b.reportFencedSettlement(key)
+	}
 	return nil
+}
+
+// settlementContext detaches the settlement from the caller's cancellation
+// and bounds it, so outcomes are recorded during a shutdown but a wedged
+// database call cannot hold the caller forever.
+func settlementContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), settlementTimeout)
+}
+
+// reportFencedSettlement surfaces a settlement that affected zero rows: the
+// claim was stolen after its lease expired, so the listener's work was, or
+// will be, repeated elsewhere. A recurring report means the lease is shorter
+// than the slowest listener.
+func (b *Bridge) reportFencedSettlement(key DeliveryKey) {
+	slog.Warn("delivery settlement was fenced out; the claim lease may be shorter than the listener",
+		"message", key.MessageID, "listener", key.ListenerID)
 }

@@ -273,32 +273,112 @@ func TestHardAgeCapRemovesUnsettledMessages(t *testing.T) {
 }
 
 func TestHeartbeatReregistersAReapedConsumer(t *testing.T) {
-	n := newSQLiteNode(t, newSQLitePath(t))
+	path := newSQLitePath(t)
+	// The event is published from a node without the listener, so delivery
+	// can only flow through the re-registered consumer's materialization,
+	// never through the publisher's local fast path.
+	publisherNode := newSQLiteNode(t, path)
+	listenerNode := newSQLiteNode(t, path)
 	var received recorder
-	if err := AttachBroadcastListener(t.Context(), n.bridge, "cache", received.handle); err != nil {
+	if err := AttachBroadcastListener(t.Context(), listenerNode.bridge, "cache", received.handle); err != nil {
 		t.Fatalf("attach cache: %v", err)
 	}
-	startDispatcher(t, NewDispatcher(n.bridge,
+	startDispatcher(t, NewDispatcher(listenerNode.bridge,
 		WithPollInterval(10*time.Millisecond),
 		WithMaintenanceInterval(20*time.Millisecond)))
 
 	// Simulate a wrong reap: another node expired this consumer while the
 	// process was stalled.
-	if _, err := n.database.ExecContext(t.Context(),
+	if _, err := listenerNode.database.ExecContext(t.Context(),
 		"DELETE FROM "+consumerTableName); err != nil {
 		t.Fatalf("reap consumer: %v", err)
 	}
 
 	waitFor(t, 5*time.Second, "the heartbeat re-registers the reaped consumer", func() bool {
-		return countRows(t, n.database, consumerTableName) == 1
+		return countRows(t, listenerNode.database, consumerTableName) == 1
 	})
 
-	if err := n.publish(t.Context(), orderPlaced{OrderID: "o-1"}); err != nil {
+	if err := publisherNode.publish(t.Context(), orderPlaced{OrderID: "o-1"}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	waitFor(t, 5*time.Second, "the re-registered consumer keeps receiving events", func() bool {
 		return received.count() == 1
 	})
+}
+
+func TestExhaustedDeliveryPinsItsMessageUntilTheHardCap(t *testing.T) {
+	n := newSQLiteNode(t, newSQLitePath(t),
+		WithMaximumAttempts(1),
+		WithRetryDelay(func(attempt int) time.Duration { return 0 }))
+	err := AttachCompetingListener(t.Context(), n.bridge, "billing",
+		func(ctx context.Context, event orderPlaced) error {
+			return fmt.Errorf("listener rejects %s", event.OrderID)
+		})
+	if err != nil {
+		t.Fatalf("attach billing: %v", err)
+	}
+
+	if err := n.publish(t.Context(), orderPlaced{OrderID: "poison"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	waitFor(t, 5*time.Second, "the delivery exhausts its single attempt", func() bool {
+		status, _, _ := readSingleDeliveryState(t, n.database)
+		return status == StatusExhausted
+	})
+
+	// The dead letter keeps its message out of settled retention, so the
+	// payload stays available for Resubmit; only the hard cap removes it.
+	reference := time.Now().UTC().Add(time.Minute)
+	deleted, err := n.store.DeleteSettledMessages(t.Context(), reference)
+	if err != nil {
+		t.Fatalf("delete settled messages: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("settled retention deleted %d messages, want 0 (the dead letter must pin it)", deleted)
+	}
+
+	deadLetters, err := n.bridge.FindExhausted(t.Context(), 10)
+	if err != nil {
+		t.Fatalf("find exhausted deliveries: %v", err)
+	}
+	if len(deadLetters) != 1 {
+		t.Fatalf("dead letters = %d, want 1", len(deadLetters))
+	}
+	if deadLetters[0].Delivery.LastError == "" {
+		t.Error("the dead letter carries no failure cause")
+	}
+
+	forced, err := n.store.DeleteMessagesOlderThan(t.Context(), reference)
+	if err != nil {
+		t.Fatalf("delete messages past the maximum age: %v", err)
+	}
+	if forced != 1 {
+		t.Fatalf("hard age cap removed %d messages, want 1", forced)
+	}
+}
+
+func TestDispatcherMaintenanceRemovesSettledMessages(t *testing.T) {
+	n := newSQLiteNode(t, newSQLitePath(t))
+	var received recorder
+	if err := AttachCompetingListener(t.Context(), n.bridge, "billing", received.handle); err != nil {
+		t.Fatalf("attach billing: %v", err)
+	}
+	startDispatcher(t, NewDispatcher(n.bridge,
+		WithPollInterval(10*time.Millisecond),
+		WithMaintenanceInterval(20*time.Millisecond),
+		WithSettledRetention(time.Millisecond)))
+
+	if err := n.publish(t.Context(), orderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	waitFor(t, 5*time.Second, "the dispatcher's own maintenance removes the settled message and its delivery", func() bool {
+		return countRows(t, n.database, messageTableName) == 0 &&
+			countRows(t, n.database, deliveryTableName) == 0
+	})
+	if received.count() != 1 {
+		t.Errorf("delivered events = %d, want 1", received.count())
+	}
 }
 
 func TestConcurrentPublishersDeliverEveryEvent(t *testing.T) {

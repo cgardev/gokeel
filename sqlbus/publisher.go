@@ -64,7 +64,7 @@ func (p *Publisher) WithAsynchronousDispatch() *Publisher {
 // listeners on other nodes are unknown at publish time; a message no
 // registered consumer covers is removed by retention.
 func (p *Publisher) Publish(ctx context.Context, event any) error {
-	_, keys, err := p.bridge.publish(ctx, p.querier.Querier(ctx), event)
+	_, keys, err := p.bridge.Publish(ctx, p.querier.Querier(ctx), event)
 	if err != nil {
 		return err
 	}

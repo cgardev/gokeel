@@ -137,17 +137,42 @@ func NewDispatcher(bridge *Bridge, options ...DispatcherOption) *Dispatcher {
 	return dispatcher
 }
 
-// Start launches the background loop: one pass immediately, which picks up
-// the backlog of a previous run, then one pass per jittered interval or wake
-// signal. The returned stop function cancels the loop and waits for an
-// in-flight pass to finish; a delivery in flight at that moment still settles
-// its outcome.
+// Start launches the background loops: one delivery pass immediately, which
+// picks up the backlog of a previous run, then one pass per jittered interval
+// or wake signal, with the consumer heartbeats on their own cadence so a long
+// delivery pass cannot starve liveness. The returned stop function cancels
+// the loops and waits for an in-flight pass to finish; a delivery in flight
+// at that moment still settles its outcome.
 func (d *Dispatcher) Start() (stop func()) {
+	if d.consumerExpiry < 3*d.maintenanceInterval {
+		slog.Warn("consumer expiry is close to the maintenance interval; "+
+			"a routine stall could reap live broadcast consumers",
+			"consumerExpiry", d.consumerExpiry, "maintenanceInterval", d.maintenanceInterval)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	deliveries := make(chan struct{})
+	liveness := make(chan struct{})
+
+	// The heartbeat loop is deliberately separate from the delivery loop: a
+	// pass draining a deep backlog can outlast the consumer expiry, and a
+	// live node must never be reaped for being busy.
+	go func() {
+		defer close(liveness)
+		ticker := time.NewTicker(d.maintenanceInterval)
+		defer ticker.Stop()
+		for {
+			d.heartbeat(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
 
 	go func() {
-		defer close(done)
+		defer close(deliveries)
 		var lastMaintenance time.Time
 		for {
 			lastMaintenance = d.pass(ctx, lastMaintenance)
@@ -157,15 +182,21 @@ func (d *Dispatcher) Start() (stop func()) {
 				timer.Stop()
 				return
 			case <-timer.C:
-			case <-d.wake:
+			case _, open := <-d.wake:
 				timer.Stop()
+				if !open {
+					// A closed wake channel would fire immediately forever,
+					// turning the loop into a busy spin; fall back to polling.
+					d.wake = nil
+				}
 			}
 		}
 	}()
 
 	return func() {
 		cancel()
-		<-done
+		<-deliveries
+		<-liveness
 	}
 }
 
@@ -183,7 +214,7 @@ func (d *Dispatcher) pass(ctx context.Context, lastMaintenance time.Time) time.T
 		if ctx.Err() != nil {
 			return lastMaintenance
 		}
-		if err := d.processAttachment(ctx, attached); err != nil {
+		if err := d.processAttachment(ctx, attached); err != nil && ctx.Err() == nil {
 			slog.Warn("dispatch pass failed; deliveries remain incomplete for redelivery",
 				"listener", attached.id, "error", err)
 		}
@@ -248,18 +279,25 @@ func (d *Dispatcher) processAttachment(ctx context.Context, attached attachment)
 	return errors.Join(failures...)
 }
 
-// maintain runs the shared background duties. Failures are reported and left
-// for the next cadence; every duty is idempotent.
-func (d *Dispatcher) maintain(ctx context.Context, now time.Time) {
+// heartbeat refreshes the liveness of every attached consumer, re-registering
+// one whose row was reaped. It runs on its own cadence, bounded so a wedged
+// database call cannot block the loop past its next tick.
+func (d *Dispatcher) heartbeat(ctx context.Context) {
+	heartbeatContext, cancel := context.WithTimeout(ctx, d.maintenanceInterval)
+	defer cancel()
+
+	now := time.Now().UTC()
 	for _, attached := range d.bridge.snapshotAttachments() {
 		key := ConsumerKey{
 			ListenerID: attached.id,
 			Instance:   d.bridge.instanceFor(attached.mode),
 			EventType:  attached.eventType,
 		}
-		alive, err := d.bridge.store.Heartbeat(ctx, key, now)
+		alive, err := d.bridge.store.Heartbeat(heartbeatContext, key, now)
 		if err != nil {
-			slog.Warn("consumer heartbeat failed", "listener", attached.id, "error", err)
+			if ctx.Err() == nil {
+				slog.Warn("consumer heartbeat failed", "listener", attached.id, "error", err)
+			}
 			continue
 		}
 		if !alive {
@@ -268,7 +306,7 @@ func (d *Dispatcher) maintain(ctx context.Context, now time.Time) {
 			// boundary instead of resurrecting the stale one, so the consumer
 			// resumes with a bounded gap rather than a full replay.
 			boundary := now.Add(-d.bridge.materializationGrace)
-			if err := d.bridge.store.RegisterConsumer(ctx, Consumer{
+			if err := d.bridge.store.RegisterConsumer(heartbeatContext, Consumer{
 				ListenerID:       attached.id,
 				Instance:         key.Instance,
 				EventType:        attached.eventType,
@@ -277,21 +315,31 @@ func (d *Dispatcher) maintain(ctx context.Context, now time.Time) {
 				Frontier:         boundary,
 				RegistrationDate: now,
 				HeartbeatDate:    now,
-			}); err != nil {
+			}); err != nil && ctx.Err() == nil {
 				slog.Warn("consumer re-registration failed", "listener", attached.id, "error", err)
 			}
 		}
 	}
+}
 
-	if _, err := d.bridge.store.ExpireBroadcastConsumers(ctx, now.Add(-d.consumerExpiry)); err != nil {
+// maintain runs the shared background duties. Failures are reported and left
+// for the next cadence; every duty is idempotent and the whole round is
+// bounded so a wedged database call cannot block delivery indefinitely.
+func (d *Dispatcher) maintain(parent context.Context, now time.Time) {
+	ctx, cancel := context.WithTimeout(parent, d.maintenanceInterval)
+	defer cancel()
+
+	if _, err := d.bridge.store.ExpireBroadcastConsumers(ctx, now.Add(-d.consumerExpiry)); err != nil && parent.Err() == nil {
 		slog.Warn("broadcast consumer expiry failed", "error", err)
 	}
-	if _, err := d.bridge.store.DeleteSettledMessages(ctx, now.Add(-d.settledRetention)); err != nil {
+	if _, err := d.bridge.store.DeleteSettledMessages(ctx, now.Add(-d.settledRetention)); err != nil && parent.Err() == nil {
 		slog.Warn("settled message retention failed", "error", err)
 	}
 	forced, err := d.bridge.store.DeleteMessagesOlderThan(ctx, now.Add(-d.maximumMessageAge))
 	if err != nil {
-		slog.Warn("maximum message age enforcement failed", "error", err)
+		if parent.Err() == nil {
+			slog.Warn("maximum message age enforcement failed", "error", err)
+		}
 	} else if forced > 0 {
 		slog.Warn("force-removed messages past the maximum age before they were fully settled",
 			"count", forced, "maximumMessageAge", d.maximumMessageAge)
@@ -299,7 +347,7 @@ func (d *Dispatcher) maintain(ctx context.Context, now time.Time) {
 	// Orphan deliveries are swept only after message deletion: removing a
 	// delivery row while its message survives would resurrect the message
 	// through the materialization anti-join.
-	if _, err := d.bridge.store.DeleteOrphanDeliveries(ctx); err != nil {
+	if _, err := d.bridge.store.DeleteOrphanDeliveries(ctx); err != nil && parent.Err() == nil {
 		slog.Warn("orphan delivery cleanup failed", "error", err)
 	}
 }

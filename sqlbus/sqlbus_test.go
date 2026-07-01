@@ -20,6 +20,10 @@ type orderPlaced struct {
 	OrderID string
 }
 
+type orderCancelled struct {
+	OrderID string
+}
+
 // node is one simulated application node: its own bus, bridge, transaction
 // manager, and publisher, sharing the database with every other node of the
 // test cluster.
@@ -69,6 +73,9 @@ func newSQLiteNode(t *testing.T, path string, options ...BridgeOption) *node {
 
 	serializer := NewJSONSerializer()
 	if err := RegisterEventType[orderPlaced](serializer, "order.placed"); err != nil {
+		t.Fatalf("register event type: %v", err)
+	}
+	if err := RegisterEventType[orderCancelled](serializer, "order.cancelled"); err != nil {
 		t.Fatalf("register event type: %v", err)
 	}
 
@@ -134,6 +141,17 @@ func countRows(t *testing.T, database *sql.DB, table string) int64 {
 	row := database.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+table)
 	if err := row.Scan(&count); err != nil {
 		t.Fatalf("count rows of %s: %v", table, err)
+	}
+	return count
+}
+
+func countDeliveriesWithStatus(t *testing.T, database *sql.DB, status Status) int64 {
+	t.Helper()
+	var count int64
+	row := database.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM "+deliveryTableName+" WHERE status = ?", string(status))
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("count deliveries with status %s: %v", status, err)
 	}
 	return count
 }
@@ -220,7 +238,7 @@ func TestRollbackDiscardsTheMessageWithTheBusinessChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin transaction: %v", err)
 	}
-	if _, _, err := n.bridge.publish(t.Context(), tx, orderPlaced{OrderID: "o-1"}); err != nil {
+	if _, _, err := n.bridge.Publish(t.Context(), tx, orderPlaced{OrderID: "o-1"}); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("publish: %v", err)
 	}

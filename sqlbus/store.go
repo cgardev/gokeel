@@ -55,6 +55,7 @@ type Store interface {
 	AdvanceFrontier(ctx context.Context, key ConsumerKey, frontier time.Time) error
 	FindDueDeliveries(ctx context.Context, listener eventbus.ListenerID, instance string,
 		now time.Time, leaseCutoff time.Time, limit int) ([]DueDelivery, error)
+	FindExhaustedDeliveries(ctx context.Context, limit int) ([]DueDelivery, error)
 
 	ClaimDelivery(ctx context.Context, key DeliveryKey, token string,
 		now time.Time, leaseCutoff time.Time) (bool, error)

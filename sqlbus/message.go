@@ -19,7 +19,9 @@
 // its delivery leads to a redelivery after the claim lease expires, so
 // listeners must be idempotent. Polling is the correctness mechanism; wake
 // signals (for example PostgreSQL LISTEN/NOTIFY wired by the caller) are
-// strictly latency hints.
+// strictly latency hints. The nodes must keep reasonably synchronized clocks:
+// the materialization grace absorbs clock skew, like commit latency, only up
+// to its configured size.
 //
 // The package is decoupled from the eventbus core: eventbus keeps its
 // zero-dependency guarantee, and applications that do not need cross-node

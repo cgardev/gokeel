@@ -28,7 +28,7 @@ const (
 // retention all compare these columns in SQL.
 const timeLayout = "2006-01-02T15:04:05.000000000Z"
 
-// deliveryColumns lists the delivery columns in the order scanDueDelivery
+// dueDeliveryColumns lists the delivery columns in the order scanDueDelivery
 // reads them, followed by the message columns it needs to restore the event.
 const dueDeliveryColumns = "d.message_id, d.listener_id, d.instance, d.status, d.attempts, " +
 	"d.claim_token, d.claim_date, d.next_attempt_date, d.completion_date, d.last_error, " +
@@ -49,9 +49,15 @@ const (
 
 	selectListenerModeStatement = "SELECT delivery_mode FROM " + listenerTableName + " WHERE listener_id = ?"
 
+	// An existing registration keeps its boundary and frontier, so a durable
+	// group resumes where it left off, but its heartbeat is refreshed: a node
+	// re-attaching under a stable identity must rejoin with fresh liveness,
+	// not with the staleness it accumulated while it was down.
 	insertConsumerStatement = "INSERT INTO " + consumerTableName + " " +
 		"(listener_id, instance, event_type, delivery_mode, start_boundary, frontier, " +
-		"registration_date, heartbeat_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING"
+		"registration_date, heartbeat_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+		"ON CONFLICT (listener_id, instance, event_type) " +
+		"DO UPDATE SET heartbeat_date = excluded.heartbeat_date"
 
 	heartbeatStatement = "UPDATE " + consumerTableName + " SET heartbeat_date = ? " +
 		"WHERE listener_id = ? AND instance = ? AND event_type = ?"
@@ -85,6 +91,11 @@ const (
 		"AND (d.status = ? OR (d.status = ? AND d.next_attempt_date <= ?) " +
 		"OR (d.status = ? AND d.claim_date < ?)) " +
 		"ORDER BY m.publication_date ASC LIMIT ?"
+
+	findExhaustedDeliveriesStatement = "SELECT " + dueDeliveryColumns + " " +
+		"FROM " + deliveryTableName + " d " +
+		"JOIN " + messageTableName + " m ON m.id = d.message_id " +
+		"WHERE d.status = ? ORDER BY m.publication_date ASC LIMIT ?"
 
 	// The eligibility guard is re-evaluated by the UPDATE itself, so exactly
 	// one of several concurrent claimants wins; the losers observe zero
@@ -318,8 +329,8 @@ func (s *sqlStore) RegisterListenerMode(
 }
 
 // RegisterConsumer records the durable consumer registration. Registering an
-// existing consumer again is a no-op that keeps the stored boundary and
-// frontier, so a durable group resumes where it left off.
+// existing consumer again keeps the stored boundary and frontier, so a
+// durable group resumes where it left off, and refreshes only the heartbeat.
 func (s *sqlStore) RegisterConsumer(ctx context.Context, consumer Consumer) error {
 	_, err := s.exec(ctx, s.database, insertConsumerStatement,
 		string(consumer.ListenerID),
@@ -443,6 +454,33 @@ func (s *sqlStore) FindDueDeliveries(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("find due deliveries of %s/%s: %w", listener, instance, err)
+	}
+	return deliveries, nil
+}
+
+// FindExhaustedDeliveries returns the dead letters, oldest publication first,
+// up to the limit.
+func (s *sqlStore) FindExhaustedDeliveries(ctx context.Context, limit int) ([]DueDelivery, error) {
+	rows, err := s.query(ctx, s.database, findExhaustedDeliveriesStatement,
+		string(StatusExhausted), int64(limit))
+	if err != nil {
+		return nil, fmt.Errorf("find exhausted deliveries: %w", err)
+	}
+	defer func() {
+		// The rows are fully consumed below; Close only releases the handle.
+		_ = rows.Close()
+	}()
+
+	var deliveries []DueDelivery
+	for rows.Next() {
+		delivery, err := scanDueDelivery(rows)
+		if err != nil {
+			return nil, err
+		}
+		deliveries = append(deliveries, delivery)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("find exhausted deliveries: %w", err)
 	}
 	return deliveries, nil
 }
