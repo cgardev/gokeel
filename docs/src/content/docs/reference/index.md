@@ -32,6 +32,10 @@ task-oriented snippets, see the [Cookbook](/gokeel/cookbook/).
 - [Schema Migrator](/gokeel/reference/migrator/) — the `Migrator` seam, the
   zero-dependency `NativeMigrator` default, the exported `Schema` and
   `SchemaHistoryTable`, and the optional goway-backed adapter.
+- [Logging](/gokeel/reference/logging/) — the level `Manager`, hierarchical
+  name inheritance, the `Configuration` document with `ParseConfiguration` and
+  `ParseLevels`, runtime `SetLevel` and `ResetLevel`, and the classic `log`
+  bridge.
 
 ## The example setup
 

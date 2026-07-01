@@ -1,6 +1,6 @@
 ---
 title: Cookbook Overview
-description: Task-oriented gokeel recipes for transactions, in-process events, the outbox, and schema migrations.
+description: Task-oriented gokeel recipes for transactions, in-process events, the outbox, schema migrations, and log levels.
 ---
 
 The cookbook collects short, copy-ready recipes. Each one states the task,
@@ -12,9 +12,9 @@ Every recipe assumes a `context.Context` named `ctx` and a `*transaction.Manager
 named `manager`, constructed once over an open `*sql.DB` with
 `transaction.NewManager(database)`. Stores resolve the executor to run against
 with `manager.Querier(ctx)`. The import paths are
-`github.com/cgardev/gokeel/transaction`, `/eventbus`, `/outbox`, and the optional
-`/outbox/gowaymigrator`. SQLite is the primary backend; PostgreSQL is supported
-the same way.
+`github.com/cgardev/gokeel/transaction`, `/eventbus`, `/outbox`, `/logging`, and
+the optional `/outbox/gowaymigrator`. SQLite is the primary backend; PostgreSQL
+is supported the same way.
 
 ## Recipes
 
@@ -48,3 +48,14 @@ the same way.
 - Create the outbox tables with the native default
 - Opt into versioned migrations with goway
 - Drive an alternative engine with a custom Migrator
+
+### [Log levels](/gokeel/cookbook/logging/)
+
+- Give each package its own logger
+- Raise one package to debug at runtime
+- Override the compiled-in levels from the environment
+- Load levels from a JSON document
+- Retune several packages at once with a group
+- Bind a logger to a type
+- Route the classic log package through the tree
+- Silence a noisy dependency

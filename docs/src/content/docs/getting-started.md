@@ -21,12 +21,13 @@ you need. Add them to your module:
 ```sh
 go get github.com/cgardev/gokeel/transaction
 go get github.com/cgardev/gokeel/eventbus
+go get github.com/cgardev/gokeel/logging
 go get github.com/cgardev/gokeel/outbox
 ```
 
-The `transaction` and `eventbus` modules have zero third-party dependencies and
-build on the standard library alone. The `outbox` module composes the other two
-and adds `google/uuid`. The only package you must supply yourself is a database
+The `transaction`, `eventbus`, and `logging` modules have zero third-party
+dependencies and build on the standard library alone. The `outbox` module
+composes the transaction and event bus modules and adds `google/uuid`. The only package you must supply yourself is a database
 driver, which you import for its side effects so that it registers itself with
 `database/sql`:
 
@@ -160,6 +161,29 @@ The publication rows are written through the unit of work, so they commit
 atomically with the order. Delivery happens once the transaction is durably on
 disk, and any entry that fails to deliver stays incomplete for resubmission.
 
+## A taste of hierarchical logging
+
+The `logging` module gives `log/slog` the level model of Spring Boot's
+`logging.level` properties: loggers are named hierarchically, a name inherits
+the level of its nearest configured ancestor, and levels can be changed while
+the program runs. You construct a `Manager`, bind loggers to package paths, and
+retune them from code, a JSON document, or an environment variable.
+
+```go
+levels := logging.NewManager(
+	logging.WithLevel("github.com/acme/shop", slog.LevelWarn),
+)
+logger := levels.Logger("github.com/acme/shop/orders")
+
+logger.Info("cache warmed") // dropped: the name inherits WARN
+
+levels.SetLevel("github.com/acme/shop/orders", slog.LevelDebug)
+logger.Info("cache warmed") // emitted: the running program was retuned
+```
+
+The level check reads an atomic snapshot, so retuning a subtree costs the
+loggers nothing on the hot path.
+
 ## Next steps
 
 - [Transactions](/gokeel/guides/transactions/) covers `Run`, `Querier`, and how
@@ -173,3 +197,5 @@ disk, and any entry that fails to deliver stays incomplete for resubmission.
   publish events after commit and recover incomplete deliveries.
 - [Schema Migrations](/gokeel/guides/schema-migrations/) explains the native
   migrator and the optional goway-backed one.
+- [Log Levels](/gokeel/guides/log-levels/) shows how packages inherit their
+  level from the hierarchy and how to retune a running program.

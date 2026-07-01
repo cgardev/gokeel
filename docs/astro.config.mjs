@@ -84,6 +84,7 @@ export default defineConfig({
 							slug: 'guides/transactional-outbox',
 						},
 						{ label: 'Schema Migrations', slug: 'guides/schema-migrations' },
+						{ label: 'Log Levels', slug: 'guides/log-levels' },
 					],
 				},
 				{
@@ -105,6 +106,7 @@ export default defineConfig({
 						{ label: 'Event Bus', slug: 'reference/event-bus' },
 						{ label: 'Outbox', slug: 'reference/outbox' },
 						{ label: 'Schema Migrator', slug: 'reference/migrator' },
+						{ label: 'Logging', slug: 'reference/logging' },
 					],
 				},
 				{
@@ -115,6 +117,7 @@ export default defineConfig({
 						{ label: 'In-Process Events', slug: 'cookbook/events' },
 						{ label: 'The Outbox', slug: 'cookbook/outbox' },
 						{ label: 'Schema Migrations', slug: 'cookbook/migrations' },
+						{ label: 'Log Levels', slug: 'cookbook/logging' },
 					],
 				},
 			],
