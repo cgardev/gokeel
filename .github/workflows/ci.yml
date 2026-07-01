@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [transaction, eventbus, logging, configuration, outbox, outbox/gowaymigrator, transaction/integration]
+        module: [transaction, eventbus, logging, configuration, outbox, outbox/gowaymigrator, sqlbus, sqlbus/gowaymigrator, transaction/integration]
     defaults:
       run:
         working-directory: ${{ matrix.module }}
@@ -57,19 +57,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: outbox core must not reference goway
+      - name: cores must not reference goway
         run: |
-          if grep -q 'github.com/cgardev/goway' outbox/go.mod; then
-            echo "::error::outbox/go.mod must not reference goway; it belongs only in outbox/gowaymigrator"
-            exit 1
-          fi
-          echo "outbox core: no goway OK"
-      - name: adapter must require goway
+          for core in outbox sqlbus; do
+            if grep -q 'github.com/cgardev/goway' "$core/go.mod"; then
+              echo "::error::$core/go.mod must not reference goway; it belongs only in $core/gowaymigrator"
+              exit 1
+            fi
+            echo "$core core: no goway OK"
+          done
+      - name: adapters must require goway
         run: |
-          if ! grep -q 'github.com/cgardev/goway' outbox/gowaymigrator/go.mod; then
-            echo "::error::outbox/gowaymigrator/go.mod must require goway"
-            exit 1
-          fi
+          for adapter in outbox/gowaymigrator sqlbus/gowaymigrator; do
+            if ! grep -q 'github.com/cgardev/goway' "$adapter/go.mod"; then
+              echo "::error::$adapter/go.mod must require goway"
+              exit 1
+            fi
+          done
           echo "goway isolation OK"
 
   integration:
@@ -78,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [transaction/integration, outbox]
+        module: [transaction/integration, outbox, sqlbus]
     defaults:
       run:
         working-directory: ${{ matrix.module }}

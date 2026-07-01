@@ -1,6 +1,6 @@
-MODULES := transaction eventbus logging configuration outbox outbox/gowaymigrator transaction/integration
+MODULES := transaction eventbus logging configuration outbox outbox/gowaymigrator sqlbus sqlbus/gowaymigrator transaction/integration
 CORES := transaction eventbus logging configuration
-FMT_DIRS := transaction eventbus logging configuration outbox outbox/gowaymigrator
+FMT_DIRS := transaction eventbus logging configuration outbox outbox/gowaymigrator sqlbus sqlbus/gowaymigrator
 
 .PHONY: build vet test fmt tidy zero-dep check release
 

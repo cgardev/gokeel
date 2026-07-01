@@ -5,7 +5,8 @@
 #
 # Because Go requires one tag per module subdirectory, a release of v0.3.0 creates
 # the tags transaction/v0.3.0, eventbus/v0.3.0, logging/v0.3.0,
-# configuration/v0.3.0, outbox/v0.3.0 and outbox/gowaymigrator/v0.3.0.
+# configuration/v0.3.0, outbox/v0.3.0, outbox/gowaymigrator/v0.3.0,
+# sqlbus/v0.3.0 and sqlbus/gowaymigrator/v0.3.0.
 #
 # Usage: scripts/release.sh v0.3.0
 set -euo pipefail
@@ -74,6 +75,40 @@ git commit -am "release: pin outbox/gowaymigrator to gokeel $V"
 git tag "outbox/gowaymigrator/$V"
 git push "$remote" "outbox/gowaymigrator/$V"
 
+# 2c) Point sqlbus at the freshly tagged leaves, exactly like outbox.
+echo "==> pinning sqlbus to gokeel $V"
+(
+	cd sqlbus
+	go mod edit \
+		-dropreplace=github.com/cgardev/gokeel/transaction \
+		-dropreplace=github.com/cgardev/gokeel/eventbus \
+		-require="github.com/cgardev/gokeel/transaction@$V" \
+		-require="github.com/cgardev/gokeel/eventbus@$V"
+	GOFLAGS=-mod=mod go mod tidy
+)
+git commit -am "release: pin sqlbus to gokeel $V"
+git tag "sqlbus/$V"
+git push "$remote" "sqlbus/$V"
+
+# 2d) Point sqlbus/gowaymigrator at the freshly tagged sqlbus, exactly like
+#     outbox/gowaymigrator: all three intra-repo edges are rewritten off the
+#     development sentinel version before the replaces are dropped.
+echo "==> pinning sqlbus/gowaymigrator to gokeel $V"
+(
+	cd sqlbus/gowaymigrator
+	go mod edit \
+		-dropreplace=github.com/cgardev/gokeel/sqlbus \
+		-dropreplace=github.com/cgardev/gokeel/transaction \
+		-dropreplace=github.com/cgardev/gokeel/eventbus \
+		-require="github.com/cgardev/gokeel/sqlbus@$V" \
+		-require="github.com/cgardev/gokeel/transaction@$V" \
+		-require="github.com/cgardev/gokeel/eventbus@$V"
+	GOFLAGS=-mod=mod go mod tidy
+)
+git commit -am "release: pin sqlbus/gowaymigrator to gokeel $V"
+git tag "sqlbus/gowaymigrator/$V"
+git push "$remote" "sqlbus/gowaymigrator/$V"
+
 # 3) Restore the relative replaces on the branch so local development keeps
 #    building from the working tree.
 echo "==> restoring development replaces"
@@ -92,7 +127,22 @@ echo "==> restoring development replaces"
 		-replace=github.com/cgardev/gokeel/eventbus=../../eventbus
 	go mod tidy
 )
+(
+	cd sqlbus
+	go mod edit \
+		-replace=github.com/cgardev/gokeel/transaction=../transaction \
+		-replace=github.com/cgardev/gokeel/eventbus=../eventbus
+	go mod tidy
+)
+(
+	cd sqlbus/gowaymigrator
+	go mod edit \
+		-replace=github.com/cgardev/gokeel/sqlbus=../ \
+		-replace=github.com/cgardev/gokeel/transaction=../../transaction \
+		-replace=github.com/cgardev/gokeel/eventbus=../../eventbus
+	go mod tidy
+)
 git commit -am "post-release: restore development replaces"
 git push "$remote" HEAD
 
-echo "==> released gokeel $V (transaction/$V, eventbus/$V, logging/$V, configuration/$V, outbox/$V, outbox/gowaymigrator/$V)"
+echo "==> released gokeel $V (transaction/$V, eventbus/$V, logging/$V, configuration/$V, outbox/$V, outbox/gowaymigrator/$V, sqlbus/$V, sqlbus/gowaymigrator/$V)"
