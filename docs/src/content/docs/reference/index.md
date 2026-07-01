@@ -36,6 +36,9 @@ task-oriented snippets, see the [Cookbook](/gokeel/cookbook/).
   name inheritance, the `Configuration` document with `ParseConfiguration` and
   `ParseLevels`, runtime `SetLevel` and `ResetLevel`, and the classic `log`
   bridge.
+- [Configuration](/gokeel/reference/conf/) — the `Loader` over layered JSON
+  sources, the `${NAME:default}` placeholder grammar, relaxed struct binding,
+  and `GenerateSchema` for editor completion.
 
 ## The example setup
 

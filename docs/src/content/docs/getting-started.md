@@ -22,12 +22,14 @@ you need. Add them to your module:
 go get github.com/cgardev/gokeel/transaction
 go get github.com/cgardev/gokeel/eventbus
 go get github.com/cgardev/gokeel/logging
+go get github.com/cgardev/gokeel/conf
 go get github.com/cgardev/gokeel/outbox
 ```
 
-The `transaction`, `eventbus`, and `logging` modules have zero third-party
-dependencies and build on the standard library alone. The `outbox` module
-composes the transaction and event bus modules and adds `google/uuid`. The only package you must supply yourself is a database
+The `transaction`, `eventbus`, `logging`, and `conf` modules have zero
+third-party dependencies and build on the standard library alone. The
+`outbox` module composes the transaction and event bus modules and adds
+`google/uuid`. The only package you must supply yourself is a database
 driver, which you import for its side effects so that it registers itself with
 `database/sql`:
 
@@ -184,6 +186,35 @@ logger.Info("cache warmed") // emitted: the running program was retuned
 The level check reads an atomic snapshot, so retuning a subtree costs the
 loggers nothing on the hot path.
 
+## A taste of externalized configuration
+
+The `conf` module carries the settings themselves: layered JSON documents
+bound onto a plain struct, with Spring-style `${VAR:default}` placeholders
+resolved from the environment at load time. `GenerateSchema` derives a JSON
+Schema from the same struct, so the editor completes and checks the document
+while it is written.
+
+```go
+type shopConfiguration struct {
+	Name string `json:"name"`
+	Port int    `json:"port"`
+}
+
+loader := conf.NewLoader(conf.WithDocument([]byte(`{
+	"name": "${SHOP_NAME:shop}",
+	"port": "${PORT:8080}"
+}`)))
+
+settings := shopConfiguration{}
+if err := loader.Load(&settings); err != nil {
+	panic(err) // an unset ${NAME} without a default aborts startup
+}
+```
+
+A key the struct does not declare fails the load with its full dotted path,
+so a typo in the document surfaces immediately instead of silently leaving a
+default in place.
+
 ## Next steps
 
 - [Transactions](/gokeel/guides/transactions/) covers `Run`, `Querier`, and how
@@ -199,3 +230,6 @@ loggers nothing on the hot path.
   migrator and the optional goway-backed one.
 - [Log Levels](/gokeel/guides/log-levels/) shows how packages inherit their
   level from the hierarchy and how to retune a running program.
+- [Externalized Configuration](/gokeel/guides/externalized-configuration/)
+  covers layered documents, environment placeholders, and the JSON Schema
+  editors complete against.

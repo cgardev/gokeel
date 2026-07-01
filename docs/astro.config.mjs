@@ -34,7 +34,7 @@ export default defineConfig({
 				starlightLlmsTxt({
 					projectName: 'gokeel',
 					description:
-						'Building blocks for a modular monolith in Go, inspired by Spring and Spring Modulith: a context-bound declarative transaction manager with propagation and commit synchronizations, a synchronous in-process event bus, a transactional outbox that publishes events after commit, hierarchical log-level management over log/slog, and externalized configuration from JSON documents with environment placeholders. The transaction, eventbus, logging, and configuration cores depend only on the Go standard library; the outbox adds a pluggable schema migrator.',
+						'Building blocks for a modular monolith in Go, inspired by Spring and Spring Modulith: a context-bound declarative transaction manager with propagation and commit synchronizations, a synchronous in-process event bus, a transactional outbox that publishes events after commit, hierarchical log-level management over log/slog, and externalized configuration from JSON documents with environment placeholders. The transaction, eventbus, logging, and conf cores depend only on the Go standard library; the outbox adds a pluggable schema migrator.',
 				}),
 			],
 			customCss: ['./src/styles/theme.css'],
@@ -83,8 +83,13 @@ export default defineConfig({
 							label: 'The Transactional Outbox',
 							slug: 'guides/transactional-outbox',
 						},
+						{ label: 'The SQL Bus', slug: 'guides/sql-bus' },
 						{ label: 'Schema Migrations', slug: 'guides/schema-migrations' },
 						{ label: 'Log Levels', slug: 'guides/log-levels' },
+						{
+							label: 'Externalized Configuration',
+							slug: 'guides/externalized-configuration',
+						},
 					],
 				},
 				{
@@ -107,6 +112,7 @@ export default defineConfig({
 						{ label: 'Outbox', slug: 'reference/outbox' },
 						{ label: 'Schema Migrator', slug: 'reference/migrator' },
 						{ label: 'Logging', slug: 'reference/logging' },
+						{ label: 'Configuration', slug: 'reference/conf' },
 					],
 				},
 				{
@@ -118,6 +124,7 @@ export default defineConfig({
 						{ label: 'The Outbox', slug: 'cookbook/outbox' },
 						{ label: 'Schema Migrations', slug: 'cookbook/migrations' },
 						{ label: 'Log Levels', slug: 'cookbook/logging' },
+						{ label: 'Configuration', slug: 'cookbook/conf' },
 					],
 				},
 			],
