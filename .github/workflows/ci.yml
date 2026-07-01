@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [transaction, eventbus, logging, configuration, outbox, outbox/gowaymigrator, sqlbus, sqlbus/gowaymigrator, transaction/integration]
+        module: [transaction, eventbus, logging, conf, outbox, outbox/gowaymigrator, sqlbus, sqlbus/gowaymigrator, transaction/integration]
     defaults:
       run:
         working-directory: ${{ matrix.module }}
@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [transaction, eventbus, logging, configuration]
+        module: [transaction, eventbus, logging, conf]
     steps:
       - uses: actions/checkout@v4
       - name: assert go.mod has no require directive

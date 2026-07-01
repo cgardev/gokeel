@@ -1,6 +1,6 @@
-// Package configuration provides externalized configuration for Go
-// applications: the analog of the application.properties and application.yml
-// story of Spring Boot, carried by JSON documents. A Loader merges ordered
+// Package conf provides externalized configuration for Go applications: the
+// analog of the application.properties and application.yml story of Spring
+// Boot, carried by JSON documents. A Loader merges ordered
 // document sources, resolves ${...} placeholders against the environment and
 // the document itself, and binds the result onto a plain Go struct with the
 // relaxed conversions the @ConfigurationProperties binding of Spring
@@ -20,7 +20,7 @@
 //
 // A Loader is immutable after construction and safe for concurrent use. The
 // package depends only on the Go standard library.
-package configuration
+package conf
 
 import (
 	"bytes"

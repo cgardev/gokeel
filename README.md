@@ -25,11 +25,11 @@ the part you import.
 | **transaction** | `github.com/cgardev/gokeel/transaction` | A context-bound, declarative transaction manager over `database/sql` with Spring-style propagation and commit synchronizations. | **None** — standard library only. |
 | **eventbus** | `github.com/cgardev/gokeel/eventbus` | A small, synchronous, in-process event bus with per-listener delivery. | **None** — standard library only. |
 | **logging** | `github.com/cgardev/gokeel/logging` | Spring Boot-style hierarchical log levels for `log/slog`: per-package and per-type levels, externally overridable and adjustable at runtime. | **None** — standard library only. |
-| **configuration** | `github.com/cgardev/gokeel/configuration` | Externalized configuration from layered JSON documents: `${VAR:default}` placeholders resolved from the environment, relaxed struct binding, and a generated JSON Schema for editor completion. | **None** — standard library only. |
+| **conf** | `github.com/cgardev/gokeel/conf` | Externalized configuration from layered JSON documents: `${VAR:default}` placeholders resolved from the environment, relaxed struct binding, and a generated JSON Schema for editor completion. | **None** — standard library only. |
 | **outbox** | `github.com/cgardev/gokeel/outbox` | The transactional outbox pattern as an in-process event publication registry: events are written in the producing transaction and delivered after commit. | `transaction`, `eventbus`, `google/uuid`. |
 | **sqlbus** | `github.com/cgardev/gokeel/sqlbus` | The eventbus extended across application nodes, with a shared SQL database (PostgreSQL or SQLite) as the only transport: competing listeners handle each event once cluster-wide, broadcast listeners once per node. | `transaction`, `eventbus`, `google/uuid`. |
 
-`transaction`, `eventbus`, `logging`, and `configuration` are leaves: each is
+`transaction`, `eventbus`, `logging`, and `conf` are leaves: each is
 its own module with a `go.mod` that has **no `require` directive at all**, a
 property enforced in CI. `outbox` and `sqlbus` sit on top and compose
 `transaction` and `eventbus`: the outbox guarantees that the listeners of one
@@ -66,7 +66,7 @@ its own tables: a built-in `NativeMigrator`, `sqlbus.Schema()`, and the opt-in
 go get github.com/cgardev/gokeel/transaction
 go get github.com/cgardev/gokeel/eventbus
 go get github.com/cgardev/gokeel/logging
-go get github.com/cgardev/gokeel/configuration
+go get github.com/cgardev/gokeel/conf
 go get github.com/cgardev/gokeel/outbox
 go get github.com/cgardev/gokeel/sqlbus
 ```
@@ -108,7 +108,7 @@ same version, so a single number identifies the whole family and any
 `gokeel/transaction@vX.Y.Z` is always compatible with `gokeel/outbox@vX.Y.Z`.
 Because Go requires one tag per module subdirectory, a release of `v0.3.0`
 creates the tags `transaction/v0.3.0`, `eventbus/v0.3.0`, `logging/v0.3.0`,
-`configuration/v0.3.0`, `outbox/v0.3.0`, `outbox/gowaymigrator/v0.3.0`,
+`conf/v0.3.0`, `outbox/v0.3.0`, `outbox/gowaymigrator/v0.3.0`,
 `sqlbus/v0.3.0`, and `sqlbus/gowaymigrator/v0.3.0`. See
 [`scripts/release.sh`](scripts/release.sh).
 
@@ -122,7 +122,7 @@ creates the tags `transaction/v0.3.0`, `eventbus/v0.3.0`, `logging/v0.3.0`,
 - `eventbus`: typed registration, ordered synchronous delivery, panic isolation.
 - `logging`: hierarchical per-package and per-type log levels over `log/slog`,
   external configuration documents, logger groups, and runtime adjustment.
-- `configuration`: layered JSON documents with deep merging, Spring-style
+- `conf`: layered JSON documents with deep merging, Spring-style
   `${VAR:default}` placeholders, relaxed struct binding, and JSON Schema
   generation for editor completion.
 - `outbox`: outbox store over PostgreSQL and SQLite, after-commit publication,

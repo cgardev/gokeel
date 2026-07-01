@@ -1,4 +1,4 @@
-package configuration
+package conf
 
 // The tests in this file are written to be run under the race detector in CI
 // (go test -race): they pin that one Loader is safely shared across
