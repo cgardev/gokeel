@@ -15,11 +15,13 @@ import (
 // schemaVersion is the canonical draft the generated schema declares.
 const schemaVersion = "https://json-schema.org/draft/2020-12/schema"
 
-// durationPattern validates the Go duration notation time.ParseDuration
+// durationPattern approximates the Go duration notation time.ParseDuration
 // reads, such as "30s" or "1h30m". The JSON Schema built-in duration format
 // means an ISO 8601 duration, which is a different notation, so a pattern is
-// used instead.
-const durationPattern = `^-?(0|(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+)$`
+// used instead. The binding stays authoritative: it also trims surrounding
+// whitespace and rejects values that overflow a time.Duration, neither of
+// which a regular expression can express.
+const durationPattern = `^[-+]?(0|(\d+(\.\d*)?|\.\d+)(ns|us|µs|μs|ms|s|m|h)((\d+(\.\d*)?|\.\d+)(ns|us|µs|μs|ms|s|m|h))*)$`
 
 // SchemaDefinition documents a schema apart from the struct the documents
 // bind onto: the struct declares the shape and carries nothing but its json
@@ -99,11 +101,24 @@ func Pointer[T any](value T) *T {
 // Objects reject unknown properties, matching the strict binding of Load;
 // the root additionally admits the $schema key itself, so a document
 // carrying the association validates cleanly. A time.Duration field accepts
-// the Go duration notation or an integer nanosecond count, a time.Time field
-// is a date-time string, and any other non-struct encoding.TextUnmarshaler
-// type is a string, exactly as the binding reads them. Before the schema is
-// returned it is resolved, which compiles every constraint and validates
-// every documented default against the schema of its field.
+// the Go duration notation or an integer nanosecond count, a time.Time
+// field is a date-time string, and any other encoding.TextUnmarshaler type
+// is a string — joined by the integer, number, or boolean form when its
+// underlying kind binds one directly. An embedded field the schema cannot
+// describe faithfully — one carrying a json name, of a non-struct type, or
+// of a type with a special-case schema — is rejected rather than described
+// wrongly.
+//
+// The schema describes the canonical form of a document; the binding stays
+// deliberately laxer. A document may therefore bind even where the schema
+// objects: the relaxed conversions read numbers and booleans out of
+// strings, a ${...} placeholder may stand in any field, JSON null keeps the
+// default of any field, required keys are a schema-level contract the
+// binding never demands, and the duration pattern is an approximation. A
+// schema-valid document binds; a binding document is not always
+// schema-valid. Before the schema is returned it is resolved, which
+// compiles every constraint and validates every documented default against
+// the schema of its field.
 func GenerateSchema(prototype any, definitions ...SchemaDefinition) ([]byte, error) {
 	prototypeType := reflect.TypeOf(prototype)
 	if prototypeType == nil {
@@ -171,10 +186,11 @@ func GenerateSchema(prototype any, definitions ...SchemaDefinition) ([]byte, err
 }
 
 // analyzeType walks the prototype ahead of the library derivation. It
-// enforces that no field smuggles schema metadata through a struct tag, and
-// it records every non-struct encoding.TextUnmarshaler type as a string
-// schema, matching the relaxed binding, which reads such values from JSON
-// strings.
+// enforces that no field smuggles schema metadata through a struct tag, it
+// rejects embedded fields the derived schema would describe differently
+// from the binding, and it records every encoding.TextUnmarshaler type as a
+// textual schema, matching the relaxed binding, which reads such values
+// from JSON strings.
 func analyzeType(valueType reflect.Type, visited map[reflect.Type]bool, overrides map[reflect.Type]*jsonschema.Schema) error {
 	valueType = dereference(valueType)
 	if visited[valueType] {
@@ -182,8 +198,8 @@ func analyzeType(valueType reflect.Type, visited map[reflect.Type]bool, override
 	}
 	visited[valueType] = true
 
-	if valueType.Kind() != reflect.Struct && reflect.PointerTo(valueType).Implements(textUnmarshalerType) {
-		overrides[valueType] = &jsonschema.Schema{Type: "string"}
+	if reflect.PointerTo(valueType).Implements(textUnmarshalerType) {
+		overrides[valueType] = textualSchema(valueType)
 		return nil
 	}
 
@@ -191,6 +207,9 @@ func analyzeType(valueType reflect.Type, visited map[reflect.Type]bool, override
 	case reflect.Slice, reflect.Array, reflect.Map:
 		return analyzeType(valueType.Elem(), visited, overrides)
 	case reflect.Struct:
+		if err := rejectUnfaithfulEmbedding(valueType); err != nil {
+			return err
+		}
 		fields := structFields(valueType)
 		for _, name := range slices.Sorted(maps.Keys(fields)) {
 			field := fields[name]
@@ -207,6 +226,52 @@ func analyzeType(valueType reflect.Type, visited map[reflect.Type]bool, override
 		}
 	}
 	return nil
+}
+
+// rejectUnfaithfulEmbedding fails on the embedded fields whose derived
+// schema would contradict the binding: the binding nests a json-named
+// embedded struct under its name and exposes an embedded non-struct field
+// under its type name, while the schema derivation promotes or refuses
+// them. A plain embedded struct promotes its fields identically on both
+// sides and passes; an embedded field excluded with a json "-" is skipped
+// identically on both sides and passes too.
+func rejectUnfaithfulEmbedding(structType reflect.Type) error {
+	for index := range structType.NumField() {
+		field := structType.Field(index)
+		if !field.Anonymous {
+			continue
+		}
+		embedded := dereference(field.Type)
+		name, tagged := jsonName(field)
+		if name == "-" && embedded.Kind() != reflect.Struct {
+			continue
+		}
+		if tagged || embedded.Kind() != reflect.Struct ||
+			reflect.PointerTo(embedded).Implements(textUnmarshalerType) {
+			return fmt.Errorf(
+				"embedded field %s.%s cannot be described faithfully by a schema; declare a named field instead",
+				structType, field.Name)
+		}
+	}
+	return nil
+}
+
+// textualSchema is the schema of an encoding.TextUnmarshaler type: a string,
+// the form UnmarshalText reads, joined by the direct numeric or boolean form
+// when the underlying kind lets the relaxed binding read one without going
+// through UnmarshalText at all.
+func textualSchema(valueType reflect.Type) *jsonschema.Schema {
+	switch valueType.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return &jsonschema.Schema{Types: []string{"string", "integer"}}
+	case reflect.Float32, reflect.Float64:
+		return &jsonschema.Schema{Types: []string{"string", "number"}}
+	case reflect.Bool:
+		return &jsonschema.Schema{Types: []string{"string", "boolean"}}
+	default:
+		return &jsonschema.Schema{Type: "string"}
+	}
 }
 
 // applyDefinition overlays one definition onto the derived schema, resolving

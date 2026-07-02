@@ -230,9 +230,24 @@ Definitions are overlaid in argument order, on an array field `Enum` and
 `Examples` constrain the elements, and every documented default is
 validated against the schema of its field. A `time.Duration` field is
 declared as a string matching the Go duration notation or an integer
-nanosecond count. A schema-metadata struct tag, a definition path that
-designates no declared field, a mistyped default, a recursive type, and a
-prototype that does not describe a JSON object are reported as errors.
+nanosecond count, and any `encoding.TextUnmarshaler` type as a string,
+joined by its direct integer, number, or boolean form when the underlying
+kind binds one.
+
+The schema describes the canonical form of a document while the binding
+stays deliberately laxer: the relaxed conversions read numbers and booleans
+out of strings, a `${...}` placeholder may stand in a non-string field, and
+JSON null keeps a field's default — all of which bind even though the
+schema flags them. Required keys are likewise a schema-level contract
+`Load` never demands, so a field whose zero value or code-level default is
+acceptable should carry `omitempty` or `omitzero`. A schema-valid document
+always binds; a binding document is not always schema-valid.
+
+A schema-metadata struct tag, an embedded field the schema cannot describe
+faithfully (one carrying a json name, of a non-struct type, or of a type
+with a special-case schema), a definition path that designates no declared
+field, a mistyped default, a recursive type, and a prototype that does not
+describe a JSON object are reported as errors.
 
 ## Errors
 

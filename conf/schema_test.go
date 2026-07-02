@@ -3,6 +3,9 @@ package conf
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
+	"net/netip"
+	"regexp"
 	"slices"
 	"testing"
 	"time"
@@ -278,6 +281,73 @@ func TestAMistypedDefaultIsRejected(t *testing.T) {
 	}
 	if _, err := GenerateSchema(documentedConfiguration{}, definition); err == nil {
 		t.Fatal("a default that does not satisfy the schema of its field was accepted")
+	}
+}
+
+func TestATextUnmarshalerStructFieldIsAString(t *testing.T) {
+	type endpoints struct {
+		Bind netip.Addr `json:"bind,omitempty"`
+	}
+	schema := generate(t, endpoints{})
+
+	if got := property(t, schema, "bind")["type"]; got != "string" {
+		t.Errorf("bind type = %v, want the string form the binding reads", got)
+	}
+}
+
+func TestANumericTextUnmarshalerFieldAcceptsStringAndInteger(t *testing.T) {
+	type verbosity struct {
+		Level slog.Level `json:"level,omitempty"`
+	}
+	schema := generate(t, verbosity{})
+
+	kinds, ok := property(t, schema, "level")["type"].([]any)
+	if !ok || len(kinds) != 2 || kinds[0] != "string" || kinds[1] != "integer" {
+		t.Errorf("level type = %v, want the string-or-integer pair the binding reads",
+			property(t, schema, "level")["type"])
+	}
+}
+
+func TestAnUnfaithfulEmbeddedFieldIsRejected(t *testing.T) {
+	type nested struct {
+		documentedConfiguration `json:"inner"`
+	}
+	if _, err := GenerateSchema(nested{}); err == nil {
+		t.Error("a json-named embedded struct was accepted; the schema would promote what the binding nests")
+	}
+
+	type leveled struct {
+		slog.Level
+	}
+	if _, err := GenerateSchema(leveled{}); err == nil {
+		t.Error("an embedded non-struct field was accepted; the schema cannot describe it as the binding reads it")
+	}
+
+	type stamped struct {
+		time.Time
+	}
+	if _, err := GenerateSchema(stamped{}); err == nil {
+		t.Error("an embedded special-case struct was accepted; the schema cannot describe it as the binding reads it")
+	}
+}
+
+func TestTheDurationPatternTracksParseDuration(t *testing.T) {
+	pattern := regexp.MustCompile(durationPattern)
+	for _, accepted := range []string{"0", "-0", "+5s", ".5s", "1.s", "5µs", "5μs", "30s", "1h30m", "-1.5h"} {
+		if _, err := time.ParseDuration(accepted); err != nil {
+			t.Fatalf("test premise broken: time.ParseDuration rejects %q", accepted)
+		}
+		if !pattern.MatchString(accepted) {
+			t.Errorf("pattern rejects %q, which time.ParseDuration accepts", accepted)
+		}
+	}
+	for _, rejected := range []string{"", "30", "s", "1d"} {
+		if _, err := time.ParseDuration(rejected); err == nil {
+			t.Fatalf("test premise broken: time.ParseDuration accepts %q", rejected)
+		}
+		if pattern.MatchString(rejected) {
+			t.Errorf("pattern accepts %q, which time.ParseDuration rejects", rejected)
+		}
 	}
 }
 
