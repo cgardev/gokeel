@@ -19,7 +19,9 @@
 // accordingly tolerates and the generated schema declares.
 //
 // A Loader is immutable after construction and safe for concurrent use. The
-// package depends only on the Go standard library.
+// package depends only on the Go standard library and, for schema
+// generation, on the Google JSON Schema implementation
+// github.com/google/jsonschema-go.
 package conf
 
 import (

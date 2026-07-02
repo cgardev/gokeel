@@ -130,23 +130,32 @@ Un marcador de posición sin valor y sin valor por defecto falla con `ErrUnresol
 
 ## GenerateSchema
 
-`GenerateSchema` deriva un documento JSON Schema draft 2020-12 a partir del struct sobre el cual se vincula la configuración: el equivalente de los metadatos de configuración que Spring Boot genera a partir de clases `@ConfigurationProperties` para el autocompletado del editor. Los nombres de los campos siguen las etiquetas `json`, un campo es requerido a menos que su etiqueta lleve `omitempty` u `omitzero`, y los objetos rechazan propiedades desconocidas, coincidiendo con la vinculación estricta de `Load`; la raíz además permite la propia clave `$schema`, tipada como una `uri-reference`, de modo que la asociación que lleva un documento se valide limpiamente.
+`GenerateSchema` deriva un documento JSON Schema draft 2020-12 a partir del struct sobre el cual se vincula la configuración, a través de la implementación de JSON Schema de Google `github.com/google/jsonschema-go`: el equivalente de los metadatos de configuración que Spring Boot genera a partir de clases `@ConfigurationProperties` para el autocompletado del editor. Los nombres de los campos siguen las etiquetas `json`, un campo es requerido a menos que su etiqueta lleve `omitempty` u `omitzero`, y los objetos rechazan propiedades desconocidas, coincidiendo con la vinculación estricta de `Load`; la raíz además admite la propia clave `$schema`, tipada como una `uri-reference`, de modo que la asociación que lleva un documento se valide limpiamente.
 
 ```go
-func GenerateSchema(prototype any) ([]byte, error)
+func GenerateSchema(prototype any, definitions ...SchemaDefinition) ([]byte, error)
 ```
+
+La etiqueta `json` es la única etiqueta que lleva el struct. Las descripciones, los valores por defecto y las restricciones viven en valores `SchemaDefinition`, indexados por la ruta punteada de cada campo en el documento, de modo que la estructura que guarda los valores queda separada de la definición de su esquema — y los campos de tipos importados pueden documentarse sin etiquetarlos:
 
 ```go
 type serverConfiguration struct {
-    Host string `json:"host" jsonschema:"description=Interface to bind,default=localhost"`
-    Port int    `json:"port" jsonschema:"minimum=1,maximum=65535"`
-    Mode string `json:"mode,omitempty" jsonschema:"enum=development,enum=production"`
+    Host string `json:"host"`
+    Port int    `json:"port"`
+    Mode string `json:"mode,omitempty"`
 }
 
-schema, err := conf.GenerateSchema(shopConfiguration{})
+schema, err := conf.GenerateSchema(serverConfiguration{}, conf.SchemaDefinition{
+    Description: "Server configuration.",
+    Fields: map[string]conf.FieldDefinition{
+        "host": {Description: "Interface to bind", Default: "localhost"},
+        "port": {Minimum: conf.Pointer(1.0), Maximum: conf.Pointer(65535.0)},
+        "mode": {Enum: []any{"development", "production"}},
+    },
+})
 ```
 
-La etiqueta de campo `jsonschema` aporta restricciones como elementos clave=valor separados por comas, la gramática establecida por el ecosistema de generación de esquemas de Go: `title`, `description`, `default`, `enum`, `example`, `pattern`, `format`, `minimum`, `maximum`, `minLength` y `maxLength`, con `enum` y `example` repetibles y una barra invertida escapando una coma literal. La etiqueta `jsonschema_description` establece una descripción como un valor completo, el canal seguro para comas para texto libre. Valores de `default`, `enum` y `example` son coaccionados al tipo JSON del campo, y en un campo de matriz `enum` y `example` restringen los elementos. Un campo `time.Duration` se declara como una cadena que coincide con la notación de duración de Go o un recuento de nanosegundos entero. Una clave de etiqueta no admitida, un tipo recursivo y un prototipo que no describe un objeto JSON se reportan como errores.
+Una `FieldDefinition` lleva `Title`, `Description`, `Default`, `Enum`, `Examples`, `Pattern`, `Format`, `Minimum`, `Maximum`, `MinLength` y `MaxLength`; `conf.Pointer` rellena los límites opcionales dentro de un literal. Las definiciones se superponen en el orden de los argumentos, en un campo de matriz `Enum` y `Examples` restringen los elementos, y cada valor por defecto documentado se valida contra el esquema de su campo. Un campo `time.Duration` se declara como una cadena que coincide con la notación de duración de Go o un recuento de nanosegundos entero. Una etiqueta de struct con metadatos de esquema, una ruta de definición que no designa un campo declarado, un valor por defecto de tipo incorrecto, un tipo recursivo y un prototipo que no describe un objeto JSON se reportan como errores.
 
 ## Errores
 

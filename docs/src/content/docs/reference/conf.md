@@ -47,8 +47,8 @@ An `Option` customizes a `Loader` at construction time.
 func WithFile(path string) Option
 ```
 
-`WithFile` appends a document read from the file at path. A missing file
-fails the `Load` with an error matching `fs.ErrNotExist`, the counterpart of
+`WithFile` appends a document read from the file at the given path. A missing
+file fails the `Load` with an error matching `fs.ErrNotExist`, the counterpart of
 the `ConfigDataLocationNotFoundException` that aborts a Spring Boot startup.
 
 ```go
@@ -61,8 +61,8 @@ conf.WithFile("/etc/shop/application.json")
 func WithOptionalFile(path string) Option
 ```
 
-`WithOptionalFile` appends a document read from the file at path, skipped
-silently when the file does not exist: the analog of the `optional:` prefix
+`WithOptionalFile` appends a document read from the file at the given path,
+skipped silently when the file does not exist: the analog of the `optional:` prefix
 of `spring.config.import`.
 
 ```go
@@ -118,9 +118,9 @@ conf.WithLookup(func(name string) (string, bool) { return vault.Read(name) })
 ## Loader.Load
 
 `Load` reads every source, merges the documents in order, resolves the
-placeholders, and binds the result onto target, which must be a non-nil
+placeholders, and binds the result onto the target, which must be a non-nil
 pointer to a struct. Names the merged document does not mention keep the
-values already present in target, so a caller sets code-level defaults by
+values already present in the target, so a caller sets code-level defaults by
 filling the struct before the call — the analog of field initializers on an
 `@ConfigurationProperties` class.
 
@@ -187,40 +187,52 @@ the Spring parser.
 ## GenerateSchema
 
 `GenerateSchema` derives a JSON Schema draft 2020-12 document from the
-struct the configuration binds onto: the counterpart of the configuration
-metadata Spring Boot generates from `@ConfigurationProperties` classes for
-editor completion. Field names follow the `json` tags, a field is required
-unless its tag carries `omitempty` or `omitzero`, and objects reject unknown
-properties, matching the strict binding of `Load`; the root additionally
-allows the `$schema` key itself, typed as a `uri-reference`, so the
-association a document carries validates cleanly.
+struct the configuration binds onto, through the Google JSON Schema
+implementation `github.com/google/jsonschema-go`: the counterpart of the
+configuration metadata Spring Boot generates from `@ConfigurationProperties`
+classes for editor completion. Field names follow the `json` tags, a field
+is required unless its tag carries `omitempty` or `omitzero`, and objects
+reject unknown properties, matching the strict binding of `Load`; the root
+additionally admits the `$schema` key itself, typed as a `uri-reference`,
+so the association a document carries validates cleanly.
 
 ```go
-func GenerateSchema(prototype any) ([]byte, error)
+func GenerateSchema(prototype any, definitions ...SchemaDefinition) ([]byte, error)
 ```
+
+The `json` tag is the only tag the struct carries. Descriptions, defaults,
+and constraints live in `SchemaDefinition` values, keyed by the dotted
+document path of each field, so the structure that stores the values stays
+separate from the definition of its schema — and fields of imported types
+can be documented without tagging them:
 
 ```go
 type serverConfiguration struct {
-    Host string `json:"host" jsonschema:"description=Interface to bind,default=localhost"`
-    Port int    `json:"port" jsonschema:"minimum=1,maximum=65535"`
-    Mode string `json:"mode,omitempty" jsonschema:"enum=development,enum=production"`
+    Host string `json:"host"`
+    Port int    `json:"port"`
+    Mode string `json:"mode,omitempty"`
 }
 
-schema, err := conf.GenerateSchema(shopConfiguration{})
+schema, err := conf.GenerateSchema(serverConfiguration{}, conf.SchemaDefinition{
+    Description: "Server configuration.",
+    Fields: map[string]conf.FieldDefinition{
+        "host": {Description: "Interface to bind", Default: "localhost"},
+        "port": {Minimum: conf.Pointer(1.0), Maximum: conf.Pointer(65535.0)},
+        "mode": {Enum: []any{"development", "production"}},
+    },
+})
 ```
 
-The `jsonschema` field tag contributes constraints as comma-separated
-key=value items, the grammar established by the Go schema-generation
-ecosystem: `title`, `description`, `default`, `enum`, `example`, `pattern`,
-`format`, `minimum`, `maximum`, `minLength`, and `maxLength`, with `enum`
-and `example` repeatable and a backslash escaping a literal comma. The
-`jsonschema_description` tag sets a description as one whole value, the
-comma-safe channel for free text. Values of `default`, `enum`, and `example`
-are coerced to the JSON type of the field, and on an array field `enum` and
-`example` constrain the elements. A `time.Duration` field is declared as a
-string matching the Go duration notation or an integer nanosecond count. An
-unsupported tag key, a recursive type, and a prototype that does not
-describe a JSON object are reported as errors.
+A `FieldDefinition` carries `Title`, `Description`, `Default`, `Enum`,
+`Examples`, `Pattern`, `Format`, `Minimum`, `Maximum`, `MinLength`, and
+`MaxLength`; `conf.Pointer` fills the optional bounds inside a literal.
+Definitions are overlaid in argument order, on an array field `Enum` and
+`Examples` constrain the elements, and every documented default is
+validated against the schema of its field. A `time.Duration` field is
+declared as a string matching the Go duration notation or an integer
+nanosecond count. A schema-metadata struct tag, a definition path that
+designates no declared field, a mistyped default, a recursive type, and a
+prototype that does not describe a JSON object are reported as errors.
 
 ## Errors
 
