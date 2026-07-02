@@ -39,30 +39,47 @@ Two consequences follow from that design:
 
 ## Is it FIFO?
 
-**Per listener, delivery is ordered oldest-first as a best effort; it is not a
-strict FIFO queue.** A dispatcher always claims the due deliveries of a
-listener in publication-date order, so under one consuming node, no failures,
-and synchronized clocks, a listener observes events in the order they were
-published. Four mechanisms — each of them deliberate — can break that order:
+**Each listener chooses.** An ordered listener is a strict FIFO queue,
+cluster-wide; an unordered listener trades order for throughput. The choice is
+declared at attachment and arbitrated durably with first-attach-wins
+semantics, so two nodes cannot silently disagree about it — the losing
+attachment fails with an error wrapping `sqlbus.ErrConflictingOrdering`.
 
-- **Retries do not block the queue.** A failed delivery waits out its backoff
-  while newer events keep flowing. There is no head-of-line blocking: the
-  price is that the retried event arrives later than events published after
-  it.
-- **Several nodes share the work.** When a competing listener is attached on
-  more than one node, different events are claimed and processed concurrently,
-  and nothing serializes their completion.
-- **The local fast path runs first.** The publishing node delivers to its own
-  listeners immediately after commit, so a locally published event can overtake
-  an older remote one that is still waiting for the next poll.
-- **Publication dates come from the publishers' clocks.** Ordering across
-  nodes is only as good as the cluster's clock synchronization.
+**Ordered listeners** attach with `WithOrderedDelivery()`:
 
-Design listeners so that correctness does not depend on strict ordering —
-at-least-once already forces them to be idempotent, and order-independence is
-the natural companion. When a workload genuinely needs strict per-key ordering,
-route it through a single competing node and treat a delivery failure as a
-stop-the-line signal rather than letting newer events pass.
+```go
+err := sqlbus.AttachCompetingListener(ctx, bridge, "ledger",
+	func(ctx context.Context, event OrderPlaced) error {
+		return ledger.Append(ctx, event.OrderID)
+	},
+	sqlbus.WithOrderedDelivery())
+```
+
+The listener processes its events strictly in publication order — the total
+order is the pair (publication date, message identifier), deterministic across
+the cluster — and strictly one at a time, no matter how many nodes host it.
+Three mechanisms uphold the order:
+
+- **Only the head of the queue is claimable.** A delivery with an earlier
+  incomplete sibling waits, so a failing event blocks its successors while it
+  retries: head-of-line blocking is what FIFO means under failure. An event
+  that exhausts its budget parks as a dead letter and the queue continues.
+- **Deliveries wait below a watermark.** An ordered delivery runs only once
+  its message is older than the materialization grace, so a publication still
+  sitting in an open transaction can never commit late and slot in front of an
+  already-delivered successor. Order costs that latency — configure the grace
+  as low as the longest publishing transaction allows.
+- **Execution is serial even against operators.** A dead letter revived with
+  `Resubmit` re-enters at its original position and waits until the delivery
+  in flight settles or its claim lease expires; within a live lease, two
+  deliveries of one ordered listener never run concurrently.
+
+**Unordered listeners** — the default — keep the old behavior: due deliveries
+are claimed oldest-first as a best effort, retries do not block the queue,
+several nodes process concurrently, and the publishing node's local fast path
+runs right after commit. Design unordered listeners so correctness does not
+depend on order; at-least-once already forces them to be idempotent, and
+order-independence is the natural companion.
 
 ## How many listeners can subscribe?
 
@@ -119,11 +136,13 @@ untouched. The failed delivery then walks an explicit state machine:
    handler cannot take down the dispatcher, or the publishing caller.
 2. **It is retried with backoff, by any hosting node.** The delivery becomes
    due again after a delay that doubles per attempt (5 seconds up to 5 minutes
-   by default, tunable with `WithRetryDelay`), and whichever node hosting the
-   listener claims it first runs the retry — a listener broken by one node's
-   local conditions can succeed on another.
+   by default, tunable per bridge with `WithRetryDelay` or per listener with
+   `WithListenerRetryDelay`), and whichever node hosting the listener claims
+   it first runs the retry — a listener broken by one node's local conditions
+   can succeed on another.
 3. **After the attempt budget, it becomes a dead letter.** Once the configured
-   attempts are spent (5 by default, `WithMaximumAttempts`), the delivery moves
+   attempts are spent (5 by default, `WithMaximumAttempts` per bridge or
+   `WithListenerMaximumAttempts` per listener), the delivery moves
    to the terminal `EXHAUSTED` state and stops consuming resources. Dead
    letters pin their message in the store — the payload stays available — and
    are listed for the operator:
@@ -149,9 +168,20 @@ when the event cannot be stored; a listener rejecting the event afterwards is
 reported through the logs and the delivery table, and handled by the retry
 machinery rather than by the code path that produced the event.
 
+## The Broker interface
+
+Everything above is also reachable through the engine-independent contract
+described in [The Broker](/gokeel/guides/broker/): `sqlbus.NewBroker(bridge,
+publisher)` satisfies `eventbus.Broker`, so consumers written against the
+contract run unchanged on the in-memory engine and on this one. The consumer
+options map directly — FIFO is `WithOrderedDelivery`, broadcast is the
+delivery mode, and the retry options become per-listener attachment options.
+
 ## Where to go next
 
-The in-process half of the story — the bus sqlbus delivers through on each
+The consumer contract this module implements — and the in-memory engine that
+shares it — is described in [The Broker](/gokeel/guides/broker/). The
+in-process half of the story — the bus sqlbus delivers through on each
 node — is described in [The Event Bus](/gokeel/guides/event-bus/). For the
 single-process ancestor of the same store-deliver-settle pattern, see
 [The Transactional Outbox](/gokeel/guides/transactional-outbox/); route each

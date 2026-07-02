@@ -15,7 +15,7 @@ export default defineConfig({
 		starlight({
 			title: 'gokeel',
 			description:
-				'Building blocks for a modular monolith in Go: a declarative transaction manager, an in-process event bus, a transactional outbox, hierarchical log-level management, and externalized configuration.',
+				'Building blocks for a modular monolith in Go: a declarative transaction manager, an in-process event bus, a broker with FIFO consumers and retries over a memory or SQL engine, a transactional outbox, hierarchical log-level management, and externalized configuration.',
 			// Internationalization. English is the root locale, so the canonical
 			// pages keep their current URLs (/gokeel/guides/...), and every
 			// translation lives under a locale directory that mirrors the English
@@ -46,7 +46,7 @@ export default defineConfig({
 				starlightLlmsTxt({
 					projectName: 'gokeel',
 					description:
-						'Building blocks for a modular monolith in Go, inspired by Spring and Spring Modulith: a context-bound declarative transaction manager with propagation and commit synchronizations, a synchronous in-process event bus, a transactional outbox that publishes events after commit, hierarchical log-level management over log/slog, and externalized configuration from JSON documents with environment placeholders. The transaction, eventbus, logging, and conf cores depend only on the Go standard library; the outbox adds a pluggable schema migrator.',
+						'Building blocks for a modular monolith in Go, inspired by Spring and Spring Modulith: a context-bound declarative transaction manager with propagation and commit synchronizations, a synchronous in-process event bus plus an engine-independent Broker contract (FIFO consumers, independent retries, dead letters) with an in-memory engine, a transactional outbox that publishes events after commit, a SQL-backed cross-node bus (sqlbus) implementing the same Broker contract durably over PostgreSQL or SQLite, hierarchical log-level management over log/slog, and externalized configuration from JSON documents with environment placeholders. The transaction, eventbus, logging, and conf cores depend only on the Go standard library; the outbox and sqlbus modules add a pluggable schema migrator.',
 				}),
 			],
 			customCss: ['./src/styles/theme.css'],
@@ -91,6 +91,7 @@ export default defineConfig({
 							slug: 'guides/propagation-and-synchronizations',
 						},
 						{ label: 'The Event Bus', slug: 'guides/event-bus' },
+						{ label: 'The Broker', slug: 'guides/broker' },
 						{
 							label: 'The Transactional Outbox',
 							slug: 'guides/transactional-outbox',
@@ -121,6 +122,7 @@ export default defineConfig({
 							slug: 'reference/synchronizations',
 						},
 						{ label: 'Event Bus', slug: 'reference/event-bus' },
+						{ label: 'Broker', slug: 'reference/broker' },
 						{ label: 'Outbox', slug: 'reference/outbox' },
 						{ label: 'Schema Migrator', slug: 'reference/migrator' },
 						{ label: 'Logging', slug: 'reference/logging' },

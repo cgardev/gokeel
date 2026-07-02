@@ -134,9 +134,14 @@ or match on something other than the type alone.
 
 ## Where to go next
 
-The event bus is the in-process half of gokeel's eventing story. For events that
-must survive a commit and be delivered exactly once, see
+The `Bus` is the synchronous primitive of gokeel's eventing story: the caller
+waits for every handler and observes every failure. When consumers should own
+queues of their own — processed FIFO, retried independently, parked as dead
+letters when they keep failing — subscribe them through
+[The Broker](/gokeel/guides/broker/), whose in-memory engine is built on this
+bus and whose SQL engine adds durability behind the same interface. For events
+that must survive a commit and be delivered at least once, see
 [The Transactional Outbox](/gokeel/guides/transactional-outbox/), which writes
-events inside the same transaction and publishes them onto a bus after the commit
-succeeds. To bind event handling to transaction lifecycle hooks, see
+events inside the same transaction and publishes them onto a bus after the
+commit succeeds. To bind event handling to transaction lifecycle hooks, see
 [Propagation & Synchronizations](/gokeel/guides/propagation-and-synchronizations/).

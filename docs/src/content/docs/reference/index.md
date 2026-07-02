@@ -25,6 +25,10 @@ task-oriented snippets, see the [Cookbook](/gokeel/cookbook/).
 - [Event Bus](/gokeel/reference/event-bus/) — the synchronous, in-process
   `Bus`, typed registration with `SubscribeTo`, addressed delivery with
   `Deliver`, multicast `Publish`, and panic isolation.
+- [Broker](/gokeel/reference/broker/) — the engine-independent consumer
+  contract: `Consume`, the consumer options for ordering, retries, and
+  broadcast, dead letters with `FindExhausted` and `Resubmit`, and the
+  constructors of the memory and SQL engines.
 - [Outbox](/gokeel/reference/outbox/) — the transactional outbox: the `Store`,
   the `SQLiteStore` and `PostgresStore` constructors, the `Registry`,
   `Publisher`, `Resubmitter`, the `JSONSerializer`, and the `Publication`

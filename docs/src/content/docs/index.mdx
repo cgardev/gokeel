@@ -1,6 +1,6 @@
 ---
 title: gokeel
-description: "Building blocks for a modular monolith in Go: a declarative transaction manager, an in-process event bus, a transactional outbox, hierarchical log levels for log/slog, and externalized configuration."
+description: "Building blocks for a modular monolith in Go: a declarative transaction manager, an in-process event bus, a broker with FIFO consumers and retries over a memory or SQL engine, a transactional outbox, hierarchical log levels for log/slog, and externalized configuration."
 template: splash
 # The landing page omits the "Edit page" link and the prev/next pagination footer.
 editUrl: false
@@ -8,7 +8,7 @@ prev: false
 next: false
 hero:
   title: The keel your application is built on
-  tagline: Building blocks for a modular monolith in Go — declarative transactions, an in-process event bus, a transactional outbox, hierarchical log levels, and externalized configuration, with a standard-library core.
+  tagline: Building blocks for a modular monolith in Go — declarative transactions, an in-process event bus, a broker with FIFO consumers over a memory or SQL engine, a transactional outbox, hierarchical log levels, and externalized configuration, with a standard-library core.
   image:
     file: ../../assets/keel.svg
     alt: gokeel
@@ -44,9 +44,14 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		A small, synchronous event bus delivers each event to the listeners
 		registered for its type, in registration order, with panic isolation.
 	</Card>
+	<Card title="Broker with two engines" icon="rocket">
+		One consumer contract — FIFO queues, independent retries, dead letters —
+		served in memory or durably over PostgreSQL/SQLite across nodes.
+	</Card>
 	<Card title="Transactional outbox" icon="seti:db">
-		Events are written in the producing transaction and delivered after commit,
-		so a publication is never lost or duplicated relative to the state change.
+		Events are written in the producing transaction and delivered at least
+		once after commit, so a publication is never lost relative to the state
+		change.
 	</Card>
 	<Card title="Hierarchical log levels" icon="setting">
 		Spring Boot's `logging.level` model for `log/slog`: one assignment on a

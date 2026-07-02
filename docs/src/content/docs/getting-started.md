@@ -127,7 +127,11 @@ join an active transaction, or begin a new one — is the default, `Required`. S
 The `eventbus` module is a small, synchronous, in-process bus that delivers
 events to subscribed listeners. You register a typed listener with `SubscribeTo`
 and multicast an event with `Publish`; delivery is ordered, and a panicking
-handler is recovered rather than allowed to take down the publisher.
+handler is recovered rather than allowed to take down the publisher. The same
+module also ships the `Broker` contract for queued consumers — FIFO ordering,
+independent retries, dead letters — with an in-memory engine here and a
+durable SQL engine in the `sqlbus` module; see
+[The Broker](/gokeel/guides/broker/).
 
 ```go
 bus := eventbus.NewBus()
@@ -224,8 +228,12 @@ default in place.
   callbacks.
 - [The Event Bus](/gokeel/guides/event-bus/) describes typed subscriptions and
   ordered, panic-isolated delivery.
+- [The Broker](/gokeel/guides/broker/) defines the consumer contract — FIFO
+  queues, retries, dead letters — and its in-memory and SQL engines.
 - [The Transactional Outbox](/gokeel/guides/transactional-outbox/) shows how to
   publish events after commit and recover incomplete deliveries.
+- [The SQL Bus](/gokeel/guides/sql-bus/) extends the bus across nodes over a
+  shared PostgreSQL or SQLite database.
 - [Schema Migrations](/gokeel/guides/schema-migrations/) explains the native
   migrator and the optional goway-backed one.
 - [Log Levels](/gokeel/guides/log-levels/) shows how packages inherit their

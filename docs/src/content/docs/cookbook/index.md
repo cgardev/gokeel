@@ -34,6 +34,9 @@ backend; PostgreSQL is supported the same way.
 - Publish an event to every matching listener
 - Fan an event out to multiple listeners
 - Isolate a failing or panicking listener
+- Queue a consumer with retries on the broker
+- Keep events in order under failure
+- Revive a dead letter
 
 ### [The outbox](/gokeel/cookbook/outbox/)
 
