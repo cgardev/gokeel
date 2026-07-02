@@ -2,6 +2,7 @@ package sqlbus
 
 import (
 	"context"
+	"net/url"
 	"strings"
 
 	"github.com/cgardev/gokeel/eventbus"
@@ -103,14 +104,16 @@ func (b *Broker) Resubmit(ctx context.Context, reference string) (bool, error) {
 }
 
 // encodeDeadLetterReference renders the delivery key as an opaque reference.
-// The listener identifier goes last because it is the only segment that may
-// contain the separator.
+// The instance and the listener identifier are path-escaped, because both are
+// caller-chosen strings that may contain the separator.
 func encodeDeadLetterReference(key DeliveryKey) string {
-	return key.MessageID.String() + "/" + key.Instance + "/" + string(key.ListenerID)
+	return key.MessageID.String() + "/" +
+		url.PathEscape(key.Instance) + "/" +
+		url.PathEscape(string(key.ListenerID))
 }
 
 func decodeDeadLetterReference(reference string) (DeliveryKey, bool) {
-	segments := strings.SplitN(reference, "/", 3)
+	segments := strings.Split(reference, "/")
 	if len(segments) != 3 {
 		return DeliveryKey{}, false
 	}
@@ -118,9 +121,17 @@ func decodeDeadLetterReference(reference string) (DeliveryKey, bool) {
 	if err != nil {
 		return DeliveryKey{}, false
 	}
+	instance, err := url.PathUnescape(segments[1])
+	if err != nil {
+		return DeliveryKey{}, false
+	}
+	listener, err := url.PathUnescape(segments[2])
+	if err != nil {
+		return DeliveryKey{}, false
+	}
 	return DeliveryKey{
 		MessageID:  messageID,
-		Instance:   segments[1],
-		ListenerID: eventbus.ListenerID(segments[2]),
+		Instance:   instance,
+		ListenerID: eventbus.ListenerID(listener),
 	}, true
 }

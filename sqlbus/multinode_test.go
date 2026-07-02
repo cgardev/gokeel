@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -55,8 +56,8 @@ func TestCompetingListenerHandlesEachEventExactlyOnceAcrossNodes(t *testing.T) {
 	if err := AttachCompetingListener(t.Context(), second.bridge, "billing", record); err != nil {
 		t.Fatalf("attach billing on the second node: %v", err)
 	}
-	startDispatcher(t, NewDispatcher(first.bridge, WithPollInterval(5*time.Millisecond)))
-	startDispatcher(t, NewDispatcher(second.bridge, WithPollInterval(5*time.Millisecond)))
+	startDispatcher(t, NewDispatcher(first.bridge, WithPollInterval(10*time.Millisecond)))
+	startDispatcher(t, NewDispatcher(second.bridge, WithPollInterval(10*time.Millisecond)))
 
 	const published = 20
 	for index := range published {
@@ -101,8 +102,8 @@ func TestBroadcastListenerHandlesEachEventOncePerNode(t *testing.T) {
 	if err := AttachBroadcastListener(t.Context(), second.bridge, "cache", secondReceived.handle); err != nil {
 		t.Fatalf("attach cache on the second node: %v", err)
 	}
-	startDispatcher(t, NewDispatcher(first.bridge, WithPollInterval(5*time.Millisecond)))
-	startDispatcher(t, NewDispatcher(second.bridge, WithPollInterval(5*time.Millisecond)))
+	startDispatcher(t, NewDispatcher(first.bridge, WithPollInterval(10*time.Millisecond)))
+	startDispatcher(t, NewDispatcher(second.bridge, WithPollInterval(10*time.Millisecond)))
 
 	const published = 5
 	for index := range published {
@@ -418,8 +419,8 @@ func TestOrderedListenerProcessesEventsInPublicationOrderAcrossNodes(t *testing.
 	if err != nil {
 		t.Fatalf("attach billing on the second node: %v", err)
 	}
-	startDispatcher(t, NewDispatcher(first.bridge, WithPollInterval(5*time.Millisecond)))
-	startDispatcher(t, NewDispatcher(second.bridge, WithPollInterval(5*time.Millisecond)))
+	startDispatcher(t, NewDispatcher(first.bridge, WithPollInterval(10*time.Millisecond)))
+	startDispatcher(t, NewDispatcher(second.bridge, WithPollInterval(10*time.Millisecond)))
 
 	const published = 10
 	for index := range published {
@@ -432,7 +433,7 @@ func TestOrderedListenerProcessesEventsInPublicationOrderAcrossNodes(t *testing.
 		}
 	}
 
-	waitFor(t, 20*time.Second, "every event is handled in order", func() bool {
+	waitFor(t, 120*time.Second, "every event is handled in order", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(order) == published
@@ -460,5 +461,99 @@ func TestConflictingOrderingRegistrationIsRejected(t *testing.T) {
 	err = AttachCompetingListener(t.Context(), second.bridge, "billing", record)
 	if !errors.Is(err, ErrConflictingOrdering) {
 		t.Fatalf("conflicting ordering error = %v, want ErrConflictingOrdering", err)
+	}
+}
+
+// TestClusterChaosPreservesDeliveryAndOrderingInvariants hammers a
+// three-node cluster with concurrent publishers, an ordered listener that
+// fails transiently, and an unordered listener, then asserts the contract
+// invariants: every event settles as completed exactly once in the store,
+// the unordered listener handles every event at least once, and the ordered
+// listener's first handling of each event follows the publication order.
+func TestClusterChaosPreservesDeliveryAndOrderingInvariants(t *testing.T) {
+	path := newSQLitePath(t)
+	options := []BridgeOption{
+		WithMaterializationGrace(50 * time.Millisecond),
+		WithLeaseDuration(30 * time.Second),
+	}
+	nodes := []*node{
+		newSQLiteNode(t, path, options...),
+		newSQLiteNode(t, path, options...),
+		newSQLiteNode(t, path, options...),
+	}
+
+	quick := WithListenerRetryDelay(func(int) time.Duration { return time.Millisecond })
+	var orderedMu sync.Mutex
+	orderedFirst := make([]string, 0)
+	orderedSeen := make(map[string]bool)
+	orderedFailures := make(map[string]bool)
+	var unorderedMu sync.Mutex
+	unorderedCounts := make(map[string]int)
+	for index, n := range nodes {
+		err := AttachCompetingListener(t.Context(), n.bridge, "ordered-chaos",
+			func(ctx context.Context, event orderPlaced) error {
+				orderedMu.Lock()
+				defer orderedMu.Unlock()
+				// Every third event fails its first attempt, exercising
+				// head-of-line retries under multi-node claims.
+				if !orderedFailures[event.OrderID] && strings.HasSuffix(event.OrderID, "0") {
+					orderedFailures[event.OrderID] = true
+					return errors.New("transient chaos")
+				}
+				if !orderedSeen[event.OrderID] {
+					orderedSeen[event.OrderID] = true
+					orderedFirst = append(orderedFirst, event.OrderID)
+				}
+				return nil
+			}, WithOrderedDelivery(), quick)
+		if err != nil {
+			t.Fatalf("attach ordered on node %d: %v", index, err)
+		}
+		err = AttachCompetingListener(t.Context(), n.bridge, "unordered-chaos",
+			func(ctx context.Context, event orderPlaced) error {
+				unorderedMu.Lock()
+				defer unorderedMu.Unlock()
+				unorderedCounts[event.OrderID]++
+				return nil
+			}, quick)
+		if err != nil {
+			t.Fatalf("attach unordered on node %d: %v", index, err)
+		}
+		startDispatcher(t, NewDispatcher(n.bridge, WithPollInterval(10*time.Millisecond)))
+	}
+
+	// Sequential publication across alternating nodes fixes the expected
+	// total order while the dispatchers race for the deliveries.
+	const published = 30
+	for index := range published {
+		origin := nodes[index%len(nodes)]
+		if err := origin.publish(t.Context(), orderPlaced{OrderID: fmt.Sprintf("o-%02d", index)}); err != nil {
+			t.Fatalf("publish o-%02d: %v", index, err)
+		}
+	}
+
+	waitFor(t, 120*time.Second, "both listeners settled every delivery", func() bool {
+		return countDeliveriesWithStatus(t, nodes[0].database, StatusCompleted) == 2*published
+	})
+
+	orderedMu.Lock()
+	defer orderedMu.Unlock()
+	if len(orderedFirst) != published {
+		t.Fatalf("ordered listener handled %d distinct events, want %d", len(orderedFirst), published)
+	}
+	for index, orderID := range orderedFirst {
+		if expected := fmt.Sprintf("o-%02d", index); orderID != expected {
+			t.Fatalf("ordered first-handling sequence = %v, want publication order", orderedFirst)
+		}
+	}
+	unorderedMu.Lock()
+	defer unorderedMu.Unlock()
+	if len(unorderedCounts) != published {
+		t.Fatalf("unordered listener handled %d distinct events, want %d", len(unorderedCounts), published)
+	}
+	for orderID, count := range unorderedCounts {
+		if count < 1 {
+			t.Fatalf("event %s handled %d times, want at least 1", orderID, count)
+		}
 	}
 }

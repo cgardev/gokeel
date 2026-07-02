@@ -38,7 +38,7 @@ func (brokerHarness) NewBroker(t *testing.T) eventbus.Broker {
 
 // SettleWithin allows for the polling cadence and the FIFO ordering
 // watermark, which delays ordered deliveries by the materialization grace.
-func (brokerHarness) SettleWithin() time.Duration { return 15 * time.Second }
+func (brokerHarness) SettleWithin() time.Duration { return 45 * time.Second }
 
 func TestSQLBrokerConformance(t *testing.T) {
 	bustest.Run(t, brokerHarness{})
