@@ -1,0 +1,47 @@
+name: gokeel-workspace
+
+services:
+  workspace:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gokeel-workspace:latest
+    container_name: gokeel-workspace
+
+    # Shared host networking: any port opened inside the container (a dev server,
+    # a database, an API) is reachable from the host as if it ran locally, and
+    # vice versa. On Docker Desktop (Windows/macOS) enable "Host networking" in
+    # Settings > Resources > Network for this to take effect.
+    network_mode: host
+
+    # Keep the container alive so commands run through "docker compose exec".
+    command: ["sleep", "infinity"]
+    stdin_open: true
+    tty: true
+
+    working_dir: /workspace
+
+    environment:
+      # Marks the shell as a sandboxed environment; run Claude Code here with
+      # "claude --dangerously-skip-permissions" to let it execute any command.
+      IS_SANDBOX: "1"
+      # Developer git identity, taken from the local (uncommitted) .env file and
+      # applied inside the container by the entrypoint on startup.
+      GIT_USER_NAME: ${GIT_USER_NAME:-}
+      GIT_USER_EMAIL: ${GIT_USER_EMAIL:-}
+
+    volumes:
+      # Mount the entire repository so work happens on the live tree.
+      - ../:/workspace
+
+      # Persist tooling caches and AI credentials across rebuilds.
+      - go-cache:/cache/go
+      - go-build-cache:/cache/go-build
+      - pnpm-store:/cache/pnpm
+      - claude-config:/cache/claude
+
+volumes:
+  go-cache:
+  go-build-cache:
+  pnpm-store:
+  claude-config:
