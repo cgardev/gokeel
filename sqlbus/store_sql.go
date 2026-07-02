@@ -3,13 +3,13 @@ package sqlbus
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/cgardev/gokeel/eventbus"
 
+	"github.com/cgardev/gooq"
 	"github.com/google/uuid"
 )
 
@@ -24,177 +24,30 @@ const (
 // timestamp. Unlike time.RFC3339Nano, which trims trailing fractional zeros,
 // this layout pads the fraction to nine digits, so the lexicographic order of
 // the TEXT columns equals their chronological order. That property is
-// load-bearing: materialization frontiers, due-delivery ordering, and
-// retention all compare these columns in SQL.
+// load-bearing: materialization frontiers, due-delivery ordering, the FIFO
+// total order, and retention all compare these columns in SQL.
 const timeLayout = "2006-01-02T15:04:05.000000000Z"
 
-// dueDeliveryColumns lists the delivery columns in the order scanDueDelivery
-// reads them, followed by the message columns it needs to restore the event.
-const dueDeliveryColumns = "d.message_id, d.listener_id, d.instance, d.status, d.attempts, " +
-	"d.claim_token, d.claim_date, d.next_attempt_date, d.completion_date, d.last_error, " +
-	"m.event_type, m.serialized_event, m.publisher_node, m.publication_date"
-
-// The statements are written with positional ? placeholders and rebound to
-// the driver's placeholder style by the dialect, mirroring the outbox store.
-const (
-	insertMessageStatement = "INSERT INTO " + messageTableName + " " +
-		"(id, event_type, serialized_event, publisher_node, publication_date) VALUES (?, ?, ?, ?, ?)"
-
-	insertDeliveryStatement = "INSERT INTO " + deliveryTableName + " " +
-		"(message_id, listener_id, instance, status, attempts) VALUES (?, ?, ?, ?, 0) " +
-		"ON CONFLICT DO NOTHING"
-
-	insertListenerModeStatement = "INSERT INTO " + listenerTableName + " " +
-		"(listener_id, delivery_mode) VALUES (?, ?) ON CONFLICT DO NOTHING"
-
-	selectListenerModeStatement = "SELECT delivery_mode FROM " + listenerTableName + " WHERE listener_id = ?"
-
-	// An existing registration keeps its boundary and frontier, so a durable
-	// group resumes where it left off, but its heartbeat is refreshed: a node
-	// re-attaching under a stable identity must rejoin with fresh liveness,
-	// not with the staleness it accumulated while it was down.
-	insertConsumerStatement = "INSERT INTO " + consumerTableName + " " +
-		"(listener_id, instance, event_type, delivery_mode, start_boundary, frontier, " +
-		"registration_date, heartbeat_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
-		"ON CONFLICT (listener_id, instance, event_type) " +
-		"DO UPDATE SET heartbeat_date = excluded.heartbeat_date"
-
-	heartbeatStatement = "UPDATE " + consumerTableName + " SET heartbeat_date = ? " +
-		"WHERE listener_id = ? AND instance = ? AND event_type = ?"
-
-	deleteConsumersStatement = "DELETE FROM " + consumerTableName + " WHERE listener_id = ?"
-
-	deleteListenerModeStatement = "DELETE FROM " + listenerTableName + " WHERE listener_id = ?"
-
-	// The frontier is read from the consumer row inside the statement, so the
-	// scan floor is always the durable one. A missing consumer row (for
-	// example, one reaped by broadcast expiry) yields a NULL frontier, whose
-	// comparison matches no rows: an unregistered consumer materializes
-	// nothing until its heartbeat re-registers it.
-	materializeDeliveriesStatement = "INSERT INTO " + deliveryTableName + " " +
-		"(message_id, listener_id, instance, status, attempts) " +
-		"SELECT m.id, ?, ?, ?, 0 FROM " + messageTableName + " m " +
-		"WHERE m.event_type = ? " +
-		"AND m.publication_date >= (SELECT c.frontier FROM " + consumerTableName + " c " +
-		"WHERE c.listener_id = ? AND c.instance = ? AND c.event_type = ?) " +
-		"AND NOT EXISTS (SELECT 1 FROM " + deliveryTableName + " d " +
-		"WHERE d.message_id = m.id AND d.listener_id = ? AND d.instance = ?) " +
-		"ON CONFLICT DO NOTHING"
-
-	advanceFrontierStatement = "UPDATE " + consumerTableName + " SET frontier = ? " +
-		"WHERE listener_id = ? AND instance = ? AND event_type = ? AND frontier < ?"
-
-	findDueDeliveriesStatement = "SELECT " + dueDeliveryColumns + " " +
-		"FROM " + deliveryTableName + " d " +
-		"JOIN " + messageTableName + " m ON m.id = d.message_id " +
-		"WHERE d.listener_id = ? AND d.instance = ? " +
-		"AND (d.status = ? OR (d.status = ? AND d.next_attempt_date <= ?) " +
-		"OR (d.status = ? AND d.claim_date < ?)) " +
-		"ORDER BY m.publication_date ASC LIMIT ?"
-
-	findExhaustedDeliveriesStatement = "SELECT " + dueDeliveryColumns + " " +
-		"FROM " + deliveryTableName + " d " +
-		"JOIN " + messageTableName + " m ON m.id = d.message_id " +
-		"WHERE d.status = ? ORDER BY m.publication_date ASC LIMIT ?"
-
-	// The eligibility guard is re-evaluated by the UPDATE itself, so exactly
-	// one of several concurrent claimants wins; the losers observe zero
-	// affected rows. Counting the attempt inside the same statement keeps the
-	// counter immune to interleaving.
-	claimDeliveryStatement = "UPDATE " + deliveryTableName + " " +
-		"SET status = ?, claim_token = ?, claim_date = ?, attempts = attempts + 1 " +
-		"WHERE message_id = ? AND listener_id = ? AND instance = ? " +
-		"AND (status = ? OR (status = ? AND next_attempt_date <= ?) " +
-		"OR (status = ? AND claim_date < ?))"
-
-	completeDeliveryStatement = "UPDATE " + deliveryTableName + " " +
-		"SET status = ?, completion_date = ?, last_error = '' " +
-		"WHERE message_id = ? AND listener_id = ? AND instance = ? " +
-		"AND status = ? AND claim_token = ?"
-
-	failDeliveryStatement = "UPDATE " + deliveryTableName + " " +
-		"SET status = CASE WHEN attempts >= ? THEN ? ELSE ? END, " +
-		"last_error = ?, next_attempt_date = ? " +
-		"WHERE message_id = ? AND listener_id = ? AND instance = ? " +
-		"AND status = ? AND claim_token = ?"
-
-	resubmitDeliveryStatement = "UPDATE " + deliveryTableName + " " +
-		"SET status = ?, attempts = 0, next_attempt_date = NULL, last_error = '' " +
-		"WHERE message_id = ? AND listener_id = ? AND instance = ? AND status IN (?, ?)"
-
-	expireBroadcastConsumersStatement = "DELETE FROM " + consumerTableName + " " +
-		"WHERE delivery_mode = ? AND heartbeat_date < ?"
-
-	// A message is settled when every registered consumer whose registration
-	// covers it (matching event type, start boundary at or before the
-	// publication) holds a completed delivery for it. Exhausted deliveries do
-	// not count as settled: a dead letter pins its message, and so its
-	// payload, until Bridge.Resubmit revives it or the hard age cap removes
-	// it loudly.
-	deleteSettledMessagesStatement = "DELETE FROM " + messageTableName + " " +
-		"WHERE publication_date < ? AND NOT EXISTS (" +
-		"SELECT 1 FROM " + consumerTableName + " c " +
-		"WHERE c.event_type = " + messageTableName + ".event_type " +
-		"AND c.start_boundary <= " + messageTableName + ".publication_date " +
-		"AND NOT EXISTS (SELECT 1 FROM " + deliveryTableName + " d " +
-		"WHERE d.message_id = " + messageTableName + ".id " +
-		"AND d.listener_id = c.listener_id AND d.instance = c.instance " +
-		"AND d.status = ?))"
-
-	deleteMessagesOlderThanStatement = "DELETE FROM " + messageTableName + " WHERE publication_date < ?"
-
-	deleteDeliveriesWithoutMessageStatement = "DELETE FROM " + deliveryTableName + " " +
-		"WHERE NOT EXISTS (SELECT 1 FROM " + messageTableName + " m " +
-		"WHERE m.id = " + deliveryTableName + ".message_id)"
-
-	deleteDeliveriesWithoutConsumerStatement = "DELETE FROM " + deliveryTableName + " " +
-		"WHERE NOT EXISTS (SELECT 1 FROM " + consumerTableName + " c " +
-		"WHERE c.listener_id = " + deliveryTableName + ".listener_id " +
-		"AND c.instance = " + deliveryTableName + ".instance)"
-)
-
-// dialect captures the per-database differences the store needs at query
-// time: which Dialect value to hand the Migrator, and how positional
-// placeholders are rendered.
+// dialect captures the per-database differences the store needs: which
+// Dialect value to hand the Migrator, and which gooq dialect renders the
+// statements.
 type dialect struct {
-	kind        Dialect
-	placeholder func(statement string) string
+	kind Dialect
+	gooq gooq.Dialect
 }
 
 func sqliteDialect() dialect {
-	return dialect{kind: DialectSQLite, placeholder: keepPlaceholders}
+	return dialect{kind: DialectSQLite, gooq: gooq.SQLite()}
 }
 
 func postgresDialect() dialect {
-	return dialect{kind: DialectPostgres, placeholder: dollarPlaceholders}
-}
-
-// keepPlaceholders leaves the ? placeholders SQLite understands unchanged.
-func keepPlaceholders(statement string) string { return statement }
-
-// dollarPlaceholders rewrites the positional ? placeholders to PostgreSQL's
-// $N form. The statements in this package never contain a ? inside a string
-// literal, so a straight left-to-right substitution is correct.
-func dollarPlaceholders(statement string) string {
-	var builder strings.Builder
-	builder.Grow(len(statement) + 8)
-	parameter := 0
-	for index := 0; index < len(statement); index++ {
-		if statement[index] == '?' {
-			parameter++
-			builder.WriteByte('$')
-			builder.WriteString(strconv.Itoa(parameter))
-			continue
-		}
-		builder.WriteByte(statement[index])
-	}
-	return builder.String()
+	return dialect{kind: DialectPostgres, gooq: gooq.Postgres()}
 }
 
 // sqlStore is the dialect-parameterized implementation shared by SQLiteStore
-// and PostgresStore. It writes messages and deliveries with native SQL and
-// brings the schema up to date through the configured Migrator
-// (NativeMigrator by default), so the core depends only on database/sql.
+// and PostgresStore. Every statement is built with gooq and rendered for the
+// active dialect at call time; the schema is brought up to date through the
+// configured Migrator (NativeMigrator by default).
 type sqlStore struct {
 	database *sql.DB
 	dialect  dialect
@@ -228,26 +81,41 @@ func newSQLStore(database *sql.DB, d dialect, options ...Option) *sqlStore {
 	return s
 }
 
-func (s *sqlStore) exec(
-	ctx context.Context, querier Querier, statement string, args ...any,
+// renderable is the statement surface the query helpers need: every gooq
+// builder renders itself for a chosen dialect.
+type renderable interface {
+	SQLFor(d gooq.Dialect) (string, []any, error)
+}
+
+// execute renders the statement for the active dialect and runs it through
+// the querier.
+func (s *sqlStore) execute(
+	ctx context.Context, querier Querier, statement renderable,
 ) (sql.Result, error) {
-	return querier.ExecContext(ctx, s.dialect.placeholder(statement), args...)
+	query, args, err := statement.SQLFor(s.dialect.gooq)
+	if err != nil {
+		return nil, err
+	}
+	return querier.ExecContext(ctx, query, args...)
 }
 
-func (s *sqlStore) query(
-	ctx context.Context, querier Querier, statement string, args ...any,
-) (*sql.Rows, error) {
-	return querier.QueryContext(ctx, s.dialect.placeholder(statement), args...)
-}
-
-func (s *sqlStore) execCounting(
-	ctx context.Context, statement string, args ...any,
-) (int64, error) {
-	result, err := s.exec(ctx, s.database, statement, args...)
+// executeCounting executes the statement on the store connection and returns
+// how many rows it affected.
+func (s *sqlStore) executeCounting(ctx context.Context, statement renderable) (int64, error) {
+	result, err := s.execute(ctx, s.database, statement)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// fetch renders the query for the active dialect and returns its rows.
+func (s *sqlStore) fetch(ctx context.Context, statement renderable) (*sql.Rows, error) {
+	query, args, err := statement.SQLFor(s.dialect.gooq)
+	if err != nil {
+		return nil, err
+	}
+	return s.database.QueryContext(ctx, query, args...)
 }
 
 // Initialize brings the database schema up to date by applying the embedded
@@ -264,14 +132,12 @@ func (s *sqlStore) Initialize(ctx context.Context) error {
 // CreateMessage writes the message through the provided querier, so it joins
 // the transaction of the business change that produced the event.
 func (s *sqlStore) CreateMessage(ctx context.Context, querier Querier, message Message) error {
-	_, err := s.exec(ctx, querier, insertMessageStatement,
-		message.ID.String(),
-		message.EventType,
-		message.SerializedEvent,
-		string(message.PublisherNode),
-		formatTime(message.PublicationDate),
-	)
-	if err != nil {
+	insert := gooq.InsertInto(gooqMessage).
+		Columns(gooqMessage.ID, gooqMessage.EventType, gooqMessage.SerializedEvent,
+			gooqMessage.PublisherNode, gooqMessage.PublicationDate).
+		Values(message.ID.String(), message.EventType, message.SerializedEvent,
+			string(message.PublisherNode), formatTime(message.PublicationDate))
+	if _, err := s.execute(ctx, querier, insert); err != nil {
 		return fmt.Errorf("persist message %s: %w", message.ID, err)
 	}
 	return nil
@@ -283,66 +149,65 @@ func (s *sqlStore) CreateMessage(ctx context.Context, querier Querier, message M
 // failing.
 func (s *sqlStore) CreateDeliveries(ctx context.Context, querier Querier, keys []DeliveryKey) error {
 	for _, key := range keys {
-		_, err := s.exec(ctx, querier, insertDeliveryStatement,
-			key.MessageID.String(),
-			string(key.ListenerID),
-			key.Instance,
-			string(StatusPending),
-		)
-		if err != nil {
+		insert := gooq.InsertInto(gooqDelivery).
+			Columns(gooqDelivery.MessageID, gooqDelivery.ListenerID,
+				gooqDelivery.Instance, gooqDelivery.Status, gooqDelivery.Attempts).
+			Values(key.MessageID.String(), string(key.ListenerID), key.Instance,
+				string(StatusPending), int64(0)).
+			OnConflictDoNothing()
+		if _, err := s.execute(ctx, querier, insert); err != nil {
 			return fmt.Errorf("persist delivery of %s to %s: %w", key.MessageID, key.ListenerID, err)
 		}
 	}
 	return nil
 }
 
-// RegisterListenerMode records the delivery mode of the listener with
-// first-registration-wins semantics and returns the mode that won, so the
-// caller can detect a conflicting registration made by another node.
+// RegisterListenerMode records the delivery mode and the ordering of the
+// listener with first-registration-wins semantics and returns the pair that
+// won, so the caller can detect a conflicting registration made by another
+// node.
 func (s *sqlStore) RegisterListenerMode(
-	ctx context.Context, id eventbus.ListenerID, mode DeliveryMode,
-) (DeliveryMode, error) {
-	if _, err := s.exec(ctx, s.database, insertListenerModeStatement,
-		string(id), string(mode)); err != nil {
-		return "", fmt.Errorf("register delivery mode of %s: %w", id, err)
+	ctx context.Context, id eventbus.ListenerID, mode DeliveryMode, ordering Ordering,
+) (DeliveryMode, Ordering, error) {
+	insert := gooq.InsertInto(gooqListener).
+		Columns(gooqListener.ListenerID, gooqListener.DeliveryMode, gooqListener.Ordering).
+		Values(string(id), string(mode), string(ordering)).
+		OnConflictDoNothing()
+	if _, err := s.execute(ctx, s.database, insert); err != nil {
+		return "", "", fmt.Errorf("register delivery mode of %s: %w", id, err)
 	}
 
-	rows, err := s.query(ctx, s.database, selectListenerModeStatement, string(id))
+	winners, err := gooq.Select2(gooqListener.DeliveryMode, gooqListener.Ordering).
+		From(gooqListener).
+		Where(gooqListener.ListenerID.EQ(string(id))).
+		Using(s.dialect.gooq).
+		Fetch(ctx, s.database)
 	if err != nil {
-		return "", fmt.Errorf("read delivery mode of %s: %w", id, err)
+		return "", "", fmt.Errorf("read delivery mode of %s: %w", id, err)
 	}
-	defer func() {
-		// The rows are fully consumed below; Close only releases the handle.
-		_ = rows.Close()
-	}()
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return "", fmt.Errorf("read delivery mode of %s: %w", id, err)
-		}
-		return "", fmt.Errorf("read delivery mode of %s: registration row is missing", id)
+	if len(winners) == 0 {
+		return "", "", fmt.Errorf("read delivery mode of %s: registration row is missing", id)
 	}
-	var winner string
-	if err := rows.Scan(&winner); err != nil {
-		return "", fmt.Errorf("read delivery mode of %s: %w", id, err)
-	}
-	return DeliveryMode(winner), nil
+	return DeliveryMode(winners[0].V1), Ordering(winners[0].V2), nil
 }
 
 // RegisterConsumer records the durable consumer registration. Registering an
 // existing consumer again keeps the stored boundary and frontier, so a
-// durable group resumes where it left off, and refreshes only the heartbeat.
+// durable group resumes where it left off, and refreshes only the heartbeat:
+// a node re-attaching under a stable identity must rejoin with fresh
+// liveness, not with the staleness it accumulated while it was down.
 func (s *sqlStore) RegisterConsumer(ctx context.Context, consumer Consumer) error {
-	_, err := s.exec(ctx, s.database, insertConsumerStatement,
-		string(consumer.ListenerID),
-		consumer.Instance,
-		consumer.EventType,
-		string(consumer.DeliveryMode),
-		formatTime(consumer.StartBoundary),
-		formatTime(consumer.Frontier),
-		formatTime(consumer.RegistrationDate),
-		formatTime(consumer.HeartbeatDate),
-	)
-	if err != nil {
+	insert := gooq.InsertInto(gooqConsumer).
+		Columns(gooqConsumer.ListenerID, gooqConsumer.Instance, gooqConsumer.EventType,
+			gooqConsumer.DeliveryMode, gooqConsumer.StartBoundary, gooqConsumer.Frontier,
+			gooqConsumer.RegistrationDate, gooqConsumer.HeartbeatDate).
+		Values(string(consumer.ListenerID), consumer.Instance, consumer.EventType,
+			string(consumer.DeliveryMode), formatTime(consumer.StartBoundary),
+			formatTime(consumer.Frontier), formatTime(consumer.RegistrationDate),
+			formatTime(consumer.HeartbeatDate)).
+		OnConflict(gooqConsumer.ListenerID, gooqConsumer.Instance, gooqConsumer.EventType).
+		DoUpdateSet(gooq.SetToExcluded(gooqConsumer.HeartbeatDate))
+	if _, err := s.execute(ctx, s.database, insert); err != nil {
 		return fmt.Errorf("register consumer %s/%s for %s: %w",
 			consumer.ListenerID, consumer.Instance, consumer.EventType, err)
 	}
@@ -354,8 +219,10 @@ func (s *sqlStore) RegisterConsumer(ctx context.Context, consumer Consumer) erro
 // broadcast expiry reaped it), so the caller can re-register with a freshly
 // computed boundary instead of resurrecting a stale one.
 func (s *sqlStore) Heartbeat(ctx context.Context, key ConsumerKey, at time.Time) (bool, error) {
-	result, err := s.exec(ctx, s.database, heartbeatStatement,
-		formatTime(at), string(key.ListenerID), key.Instance, key.EventType)
+	update := gooq.Update(gooqConsumer).
+		Set(gooqConsumer.HeartbeatDate.Set(formatTime(at))).
+		Where(consumerKeyCondition(gooqConsumer, key))
+	result, err := s.execute(ctx, s.database, update)
 	if err != nil {
 		return false, fmt.Errorf("heartbeat consumer %s/%s: %w", key.ListenerID, key.Instance, err)
 	}
@@ -366,13 +233,22 @@ func (s *sqlStore) Heartbeat(ctx context.Context, key ConsumerKey, at time.Time)
 	return affected > 0, nil
 }
 
+// consumerKeyCondition matches one durable consumer registration.
+func consumerKeyCondition(c *consumerTable, key ConsumerKey) gooq.Condition {
+	return c.ListenerID.EQ(string(key.ListenerID)).
+		And(c.Instance.EQ(key.Instance)).
+		And(c.EventType.EQ(key.EventType))
+}
+
 // RemoveListener deletes every consumer registration and the delivery-mode
 // row of the listener, unpinning its messages from retention.
 func (s *sqlStore) RemoveListener(ctx context.Context, id eventbus.ListenerID) error {
-	if _, err := s.exec(ctx, s.database, deleteConsumersStatement, string(id)); err != nil {
+	consumers := gooq.DeleteFrom(gooqConsumer).Where(gooqConsumer.ListenerID.EQ(string(id)))
+	if _, err := s.execute(ctx, s.database, consumers); err != nil {
 		return fmt.Errorf("remove consumers of %s: %w", id, err)
 	}
-	if _, err := s.exec(ctx, s.database, deleteListenerModeStatement, string(id)); err != nil {
+	modes := gooq.DeleteFrom(gooqListener).Where(gooqListener.ListenerID.EQ(string(id)))
+	if _, err := s.execute(ctx, s.database, modes); err != nil {
 		return fmt.Errorf("remove delivery mode of %s: %w", id, err)
 	}
 	return nil
@@ -380,20 +256,39 @@ func (s *sqlStore) RemoveListener(ctx context.Context, id eventbus.ListenerID) e
 
 // MaterializeDeliveries inserts one pending delivery row for every message
 // the consumer covers but has no row for yet, scanning from the consumer's
-// durable frontier. The composite primary key makes the insert idempotent, so
-// concurrent materializations of one consumer on several nodes converge.
+// durable frontier. The frontier is read from the consumer row inside the
+// statement, so the scan floor is always the durable one; a missing consumer
+// row (for example, one reaped by broadcast expiry) yields a NULL frontier,
+// whose comparison matches no rows. The composite primary key makes the
+// insert idempotent, so concurrent materializations converge.
 func (s *sqlStore) MaterializeDeliveries(ctx context.Context, key ConsumerKey) (int64, error) {
-	count, err := s.execCounting(ctx, materializeDeliveriesStatement,
-		string(key.ListenerID),
-		key.Instance,
-		string(StatusPending),
-		key.EventType,
-		string(key.ListenerID),
-		key.Instance,
-		key.EventType,
-		string(key.ListenerID),
-		key.Instance,
-	)
+	m := newMessageTable("m")
+	existing := newDeliveryTable("d")
+
+	// The conflict clause is attached before the select source: both calls
+	// mutate the same statement, and the step interface only exposes the
+	// conflict step ahead of the source.
+	insert := gooq.InsertInto(gooqDelivery).
+		Columns(gooqDelivery.MessageID, gooqDelivery.ListenerID,
+			gooqDelivery.Instance, gooqDelivery.Status, gooqDelivery.Attempts)
+	insert.OnConflictDoNothing()
+	statement := insert.Select(
+		gooq.Select5(
+			m.ID,
+			gooq.RawValue[string]("?", string(key.ListenerID)),
+			gooq.RawValue[string]("?", key.Instance),
+			gooq.RawValue[string]("?", string(StatusPending)),
+			gooq.RawValue[int64]("?", int64(0)),
+		).From(m).
+			Where(m.EventType.EQ(key.EventType).
+				And(m.PublicationDate.GEField(frontierOf(key))).
+				And(gooq.NotExists(
+					gooq.Select1(gooq.Raw[int64]("1")).From(existing).
+						Where(existing.MessageID.EQField(m.ID).
+							And(existing.ListenerID.EQ(string(key.ListenerID))).
+							And(existing.Instance.EQ(key.Instance)))))))
+
+	count, err := s.executeCounting(ctx, statement)
 	if err != nil {
 		return 0, fmt.Errorf("materialize deliveries of %s/%s for %s: %w",
 			key.ListenerID, key.Instance, key.EventType, err)
@@ -401,59 +296,124 @@ func (s *sqlStore) MaterializeDeliveries(ctx context.Context, key ConsumerKey) (
 	return count, nil
 }
 
+// frontierOf is the scalar subquery reading the durable frontier of the
+// consumer.
+func frontierOf(key ConsumerKey) gooq.Field[string] {
+	c := newConsumerTable("c")
+	return gooq.ScalarSubquery[string](
+		gooq.Select1(c.Frontier).From(c).Where(consumerKeyCondition(c, key)))
+}
+
 // AdvanceFrontier raises the materialization floor of the consumer. The
 // monotonic guard makes concurrent advances from several nodes converge on
 // the highest value.
 func (s *sqlStore) AdvanceFrontier(ctx context.Context, key ConsumerKey, frontier time.Time) error {
 	value := formatTime(frontier)
-	_, err := s.exec(ctx, s.database, advanceFrontierStatement,
-		value, string(key.ListenerID), key.Instance, key.EventType, value)
-	if err != nil {
+	update := gooq.Update(gooqConsumer).
+		Set(gooqConsumer.Frontier.Set(value)).
+		Where(consumerKeyCondition(gooqConsumer, key).And(gooqConsumer.Frontier.LT(value)))
+	if _, err := s.execute(ctx, s.database, update); err != nil {
 		return fmt.Errorf("advance frontier of %s/%s for %s: %w",
 			key.ListenerID, key.Instance, key.EventType, err)
 	}
 	return nil
 }
 
-// FindDueDeliveries returns the deliveries of the consumer that are ready to
-// claim, oldest publication first: pending rows, failed rows past their
-// backoff, and processing rows whose claim lease expired.
+// dueCondition matches the deliveries that are ready to claim: pending rows,
+// failed rows past their backoff, and processing rows whose claim lease
+// expired.
+func dueCondition(d *deliveryTable, now, leaseCutoff time.Time) gooq.Condition {
+	return d.Status.EQ(string(StatusPending)).
+		Or(d.Status.EQ(string(StatusFailed)).And(d.NextAttemptDate.LE(formatTime(now)))).
+		Or(d.Status.EQ(string(StatusProcessing)).And(d.ClaimDate.LT(formatTime(leaseCutoff))))
+}
+
+// earlierIncompleteExists matches when the consumer holds an incomplete
+// delivery earlier than the given position in the total order
+// (publication_date, message_id). Exhausted deliveries deliberately do not
+// count: a dead letter parks and its successors continue.
+func earlierIncompleteExists(
+	listener eventbus.ListenerID, instance string,
+	before gooq.Field[string], beforeID gooq.Field[string],
+) gooq.Condition {
+	d2 := newDeliveryTable("d2")
+	m2 := newMessageTable("m2")
+	return gooq.Exists(
+		gooq.Select1(gooq.Raw[int64]("1")).From(d2).
+			Join(m2).On(m2.ID.EQField(d2.MessageID)).
+			Where(d2.ListenerID.EQ(string(listener)).
+				And(d2.Instance.EQ(instance)).
+				And(d2.Status.In(incompleteStatuses()...)).
+				And(m2.PublicationDate.LTField(before).
+					Or(m2.PublicationDate.EQField(before).And(m2.ID.LTField(beforeID))))))
+}
+
+// concurrentProcessingExists matches when the consumer holds another delivery
+// in processing under a live lease. FIFO execution is serial per consumer:
+// without this guard a resubmitted predecessor, which nothing precedes in the
+// total order, could start while its successor is still running.
+func concurrentProcessingExists(
+	listener eventbus.ListenerID, instance string,
+	other uuid.UUID, leaseCutoff time.Time,
+) gooq.Condition {
+	d3 := newDeliveryTable("d3")
+	return gooq.Exists(
+		gooq.Select1(gooq.Raw[int64]("1")).From(d3).
+			Where(d3.ListenerID.EQ(string(listener)).
+				And(d3.Instance.EQ(instance)).
+				And(d3.Status.EQ(string(StatusProcessing))).
+				And(d3.ClaimDate.GE(formatTime(leaseCutoff))).
+				And(d3.MessageID.NE(other.String()))))
+}
+
+// FindDueDeliveries returns the claimable deliveries of the consumer in the
+// total order (publication_date, message_id). For a FIFO consumer only the
+// head of the queue is claimable, and only below the materialization
+// frontier: below that watermark every visible message already has its
+// delivery row, so no late-committing publication can slot in front of the
+// head.
 func (s *sqlStore) FindDueDeliveries(
 	ctx context.Context,
-	listener eventbus.ListenerID,
-	instance string,
+	key ConsumerKey,
+	ordering Ordering,
 	now time.Time,
 	leaseCutoff time.Time,
 	limit int,
 ) ([]DueDelivery, error) {
-	rows, err := s.query(ctx, s.database, findDueDeliveriesStatement,
-		string(listener),
-		instance,
-		string(StatusPending),
-		string(StatusFailed),
-		formatTime(now),
-		string(StatusProcessing),
-		formatTime(leaseCutoff),
-		int64(limit),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("find due deliveries of %s/%s: %w", listener, instance, err)
-	}
-	defer func() {
-		// The rows are fully consumed below; Close only releases the handle.
-		_ = rows.Close()
-	}()
+	d := newDeliveryTable("d")
+	m := newMessageTable("m")
 
-	var deliveries []DueDelivery
-	for rows.Next() {
-		delivery, err := scanDueDelivery(rows)
-		if err != nil {
-			return nil, err
-		}
-		deliveries = append(deliveries, delivery)
+	condition := d.ListenerID.EQ(string(key.ListenerID)).
+		And(d.Instance.EQ(key.Instance)).
+		And(dueCondition(d, now, leaseCutoff))
+	if ordering == OrderingFIFO {
+		condition = condition.
+			And(m.PublicationDate.LTField(frontierOf(key))).
+			And(gooq.Not(earlierIncompleteExists(
+				key.ListenerID, key.Instance, m.PublicationDate, m.ID)))
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("find due deliveries of %s/%s: %w", listener, instance, err)
+
+	query := gooq.Select14(
+		d.MessageID, d.ListenerID, d.Instance, d.Status, d.Attempts,
+		d.ClaimToken,
+		gooq.NewField[sql.NullString](d.TableImpl, "claim_date"),
+		gooq.NewField[sql.NullString](d.TableImpl, "next_attempt_date"),
+		gooq.NewField[sql.NullString](d.TableImpl, "completion_date"),
+		d.LastError,
+		m.EventType, m.SerializedEvent, m.PublisherNode, m.PublicationDate,
+	).From(d).
+		Join(m).On(m.ID.EQField(d.MessageID)).
+		Where(condition).
+		OrderBy(m.PublicationDate.Asc(), m.ID.Asc()).
+		Limit(int64(limit))
+
+	rows, err := s.fetch(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("find due deliveries of %s/%s: %w", key.ListenerID, key.Instance, err)
+	}
+	deliveries, err := collectDueDeliveries(rows)
+	if err != nil {
+		return nil, fmt.Errorf("find due deliveries of %s/%s: %w", key.ListenerID, key.Instance, err)
 	}
 	return deliveries, nil
 }
@@ -461,50 +421,60 @@ func (s *sqlStore) FindDueDeliveries(
 // FindExhaustedDeliveries returns the dead letters, oldest publication first,
 // up to the limit.
 func (s *sqlStore) FindExhaustedDeliveries(ctx context.Context, limit int) ([]DueDelivery, error) {
-	rows, err := s.query(ctx, s.database, findExhaustedDeliveriesStatement,
-		string(StatusExhausted), int64(limit))
+	d := newDeliveryTable("d")
+	m := newMessageTable("m")
+	query := gooq.Select14(
+		d.MessageID, d.ListenerID, d.Instance, d.Status, d.Attempts,
+		d.ClaimToken,
+		gooq.NewField[sql.NullString](d.TableImpl, "claim_date"),
+		gooq.NewField[sql.NullString](d.TableImpl, "next_attempt_date"),
+		gooq.NewField[sql.NullString](d.TableImpl, "completion_date"),
+		d.LastError,
+		m.EventType, m.SerializedEvent, m.PublisherNode, m.PublicationDate,
+	).From(d).
+		Join(m).On(m.ID.EQField(d.MessageID)).
+		Where(d.Status.EQ(string(StatusExhausted))).
+		OrderBy(m.PublicationDate.Asc(), m.ID.Asc()).
+		Limit(int64(limit))
+
+	rows, err := s.fetch(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("find exhausted deliveries: %w", err)
 	}
-	defer func() {
-		// The rows are fully consumed below; Close only releases the handle.
-		_ = rows.Close()
-	}()
-
-	var deliveries []DueDelivery
-	for rows.Next() {
-		delivery, err := scanDueDelivery(rows)
-		if err != nil {
-			return nil, err
-		}
-		deliveries = append(deliveries, delivery)
-	}
-	if err := rows.Err(); err != nil {
+	deliveries, err := collectDueDeliveries(rows)
+	if err != nil {
 		return nil, fmt.Errorf("find exhausted deliveries: %w", err)
 	}
 	return deliveries, nil
 }
 
+// claimCondition is the shared eligibility guard of the claim statements: the
+// row must identify the delivery, be due, and still hold the attempt count
+// the claimant observed, so the attempt counter doubles as a fencing
+// generation exactly like the outbox store.
+func claimCondition(key DeliveryKey, attempts int, now, leaseCutoff time.Time) gooq.Condition {
+	return gooqDelivery.MessageID.EQ(key.MessageID.String()).
+		And(gooqDelivery.ListenerID.EQ(string(key.ListenerID))).
+		And(gooqDelivery.Instance.EQ(key.Instance)).
+		And(gooqDelivery.Attempts.EQ(int64(attempts))).
+		And(dueCondition(gooqDelivery, now, leaseCutoff))
+}
+
 // ClaimDelivery atomically transitions the delivery into processing under the
-// given token, counting the attempt. The eligibility guard makes the update
-// succeed for exactly one of several concurrent claimants; the losers observe
-// zero affected rows.
+// given token, counting the attempt. The eligibility and attempt guards are
+// re-evaluated by the update itself, so exactly one of several concurrent
+// claimants wins; the losers observe zero affected rows.
 func (s *sqlStore) ClaimDelivery(
-	ctx context.Context, key DeliveryKey, token string, now time.Time, leaseCutoff time.Time,
+	ctx context.Context, key DeliveryKey, token string,
+	now time.Time, leaseCutoff time.Time, attempts int,
 ) (bool, error) {
-	result, err := s.exec(ctx, s.database, claimDeliveryStatement,
-		string(StatusProcessing),
-		token,
-		formatTime(now),
-		key.MessageID.String(),
-		string(key.ListenerID),
-		key.Instance,
-		string(StatusPending),
-		string(StatusFailed),
-		formatTime(now),
-		string(StatusProcessing),
-		formatTime(leaseCutoff),
-	)
+	update := gooq.Update(gooqDelivery).
+		Set(gooqDelivery.Status.Set(string(StatusProcessing))).
+		Set(gooqDelivery.ClaimToken.Set(token)).
+		Set(gooqDelivery.ClaimDate.Set(formatTime(now))).
+		Set(gooqDelivery.Attempts.Set(int64(attempts + 1))).
+		Where(claimCondition(key, attempts, now, leaseCutoff))
+	result, err := s.execute(ctx, s.database, update)
 	if err != nil {
 		return false, fmt.Errorf("claim delivery of %s to %s: %w", key.MessageID, key.ListenerID, err)
 	}
@@ -515,21 +485,64 @@ func (s *sqlStore) ClaimDelivery(
 	return affected > 0, nil
 }
 
-// CompleteDelivery settles a successful delivery. The claim-token fence makes
-// a zombie dispatcher, whose lease expired and whose claim was stolen, affect
-// zero rows; it reports whether this caller's settlement won.
+// ClaimDeliveryInOrder claims like ClaimDelivery but re-verifies inside the
+// update that no earlier incomplete delivery of the same consumer exists —
+// between the find and the claim a predecessor may have been resubmitted, and
+// its revived delivery must run first — and that no other delivery of the
+// consumer is processing under a live lease, so FIFO execution stays serial
+// even when a revived predecessor and its running successor race. The claimed
+// row never excludes itself, because nothing is earlier than itself in the
+// total order.
+func (s *sqlStore) ClaimDeliveryInOrder(
+	ctx context.Context, key DeliveryKey, token string,
+	now time.Time, leaseCutoff time.Time, attempts int, publicationDate time.Time,
+) (bool, error) {
+	position := formatTime(publicationDate)
+	update := gooq.Update(gooqDelivery).
+		Set(gooqDelivery.Status.Set(string(StatusProcessing))).
+		Set(gooqDelivery.ClaimToken.Set(token)).
+		Set(gooqDelivery.ClaimDate.Set(formatTime(now))).
+		Set(gooqDelivery.Attempts.Set(int64(attempts + 1))).
+		Where(claimCondition(key, attempts, now, leaseCutoff).
+			And(gooq.Not(earlierIncompleteExists(
+				key.ListenerID, key.Instance,
+				gooq.RawValue[string]("?", position),
+				gooq.RawValue[string]("?", key.MessageID.String())))).
+			And(gooq.Not(concurrentProcessingExists(
+				key.ListenerID, key.Instance, key.MessageID, leaseCutoff))))
+	result, err := s.execute(ctx, s.database, update)
+	if err != nil {
+		return false, fmt.Errorf("claim delivery of %s to %s in order: %w", key.MessageID, key.ListenerID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("inspect ordered claim of %s to %s: %w", key.MessageID, key.ListenerID, err)
+	}
+	return affected > 0, nil
+}
+
+// settlementCondition is the claim-token fence of the settlement statements:
+// a zombie dispatcher, whose lease expired and whose claim was stolen,
+// affects zero rows.
+func settlementCondition(key DeliveryKey, token string) gooq.Condition {
+	return gooqDelivery.MessageID.EQ(key.MessageID.String()).
+		And(gooqDelivery.ListenerID.EQ(string(key.ListenerID))).
+		And(gooqDelivery.Instance.EQ(key.Instance)).
+		And(gooqDelivery.Status.EQ(string(StatusProcessing))).
+		And(gooqDelivery.ClaimToken.EQ(token))
+}
+
+// CompleteDelivery settles a successful delivery; it reports whether this
+// caller's settlement won.
 func (s *sqlStore) CompleteDelivery(
 	ctx context.Context, key DeliveryKey, token string, completionDate time.Time,
 ) (bool, error) {
-	result, err := s.exec(ctx, s.database, completeDeliveryStatement,
-		string(StatusCompleted),
-		formatTime(completionDate),
-		key.MessageID.String(),
-		string(key.ListenerID),
-		key.Instance,
-		string(StatusProcessing),
-		token,
-	)
+	update := gooq.Update(gooqDelivery).
+		Set(gooqDelivery.Status.Set(string(StatusCompleted))).
+		Set(gooqDelivery.CompletionDate.Set(formatTime(completionDate))).
+		Set(gooqDelivery.LastError.Set("")).
+		Where(settlementCondition(key, token))
+	result, err := s.execute(ctx, s.database, update)
 	if err != nil {
 		return false, fmt.Errorf("complete delivery of %s to %s: %w", key.MessageID, key.ListenerID, err)
 	}
@@ -542,27 +555,28 @@ func (s *sqlStore) CompleteDelivery(
 
 // FailDelivery settles a failed delivery: it records the cause and the next
 // attempt date, and moves the delivery to failed, or to exhausted once the
-// attempt budget is spent. The claim-token fence mirrors CompleteDelivery.
+// attempt budget is spent. The token fence guarantees the attempts value set
+// by this dispatcher's claim is still current, so the exhaustion decision is
+// computed from it without re-reading the row.
 func (s *sqlStore) FailDelivery(
 	ctx context.Context,
 	key DeliveryKey,
 	token string,
 	cause string,
 	nextAttemptDate time.Time,
+	attempts int,
 	maximumAttempts int,
 ) (bool, error) {
-	result, err := s.exec(ctx, s.database, failDeliveryStatement,
-		int64(maximumAttempts),
-		string(StatusExhausted),
-		string(StatusFailed),
-		cause,
-		formatTime(nextAttemptDate),
-		key.MessageID.String(),
-		string(key.ListenerID),
-		key.Instance,
-		string(StatusProcessing),
-		token,
-	)
+	status := StatusFailed
+	if attempts >= maximumAttempts {
+		status = StatusExhausted
+	}
+	update := gooq.Update(gooqDelivery).
+		Set(gooqDelivery.Status.Set(string(status))).
+		Set(gooqDelivery.LastError.Set(cause)).
+		Set(gooqDelivery.NextAttemptDate.Set(formatTime(nextAttemptDate))).
+		Where(settlementCondition(key, token))
+	result, err := s.execute(ctx, s.database, update)
 	if err != nil {
 		return false, fmt.Errorf("fail delivery of %s to %s: %w", key.MessageID, key.ListenerID, err)
 	}
@@ -574,16 +588,20 @@ func (s *sqlStore) FailDelivery(
 }
 
 // ResubmitDelivery gives a failed or exhausted delivery a fresh attempt
-// budget. It reports false when the delivery is not in a resubmittable state.
+// budget, clearing the backoff of the failed attempts so the fresh budget
+// starts immediately. It reports false when the delivery is not in a
+// resubmittable state.
 func (s *sqlStore) ResubmitDelivery(ctx context.Context, key DeliveryKey) (bool, error) {
-	result, err := s.exec(ctx, s.database, resubmitDeliveryStatement,
-		string(StatusPending),
-		key.MessageID.String(),
-		string(key.ListenerID),
-		key.Instance,
-		string(StatusFailed),
-		string(StatusExhausted),
-	)
+	update := gooq.Update(gooqDelivery).
+		Set(gooqDelivery.Status.Set(string(StatusPending))).
+		Set(gooqDelivery.Attempts.Set(int64(0))).
+		Set(gooq.NewField[sql.NullString](gooqDelivery.TableImpl, "next_attempt_date").Set(sql.NullString{})).
+		Set(gooqDelivery.LastError.Set("")).
+		Where(gooqDelivery.MessageID.EQ(key.MessageID.String()).
+			And(gooqDelivery.ListenerID.EQ(string(key.ListenerID))).
+			And(gooqDelivery.Instance.EQ(key.Instance)).
+			And(gooqDelivery.Status.In(string(StatusFailed), string(StatusExhausted))))
+	result, err := s.execute(ctx, s.database, update)
 	if err != nil {
 		return false, fmt.Errorf("resubmit delivery of %s to %s: %w", key.MessageID, key.ListenerID, err)
 	}
@@ -598,8 +616,10 @@ func (s *sqlStore) ResubmitDelivery(ctx context.Context, key DeliveryKey) (bool,
 // older than the cutoff, so consumers of nodes that left the cluster stop
 // pinning messages. Competing registrations are durable and never expire.
 func (s *sqlStore) ExpireBroadcastConsumers(ctx context.Context, cutoff time.Time) (int64, error) {
-	count, err := s.execCounting(ctx, expireBroadcastConsumersStatement,
-		string(DeliveryModeBroadcast), formatTime(cutoff))
+	statement := gooq.DeleteFrom(gooqConsumer).
+		Where(gooqConsumer.DeliveryMode.EQ(string(DeliveryModeBroadcast)).
+			And(gooqConsumer.HeartbeatDate.LT(formatTime(cutoff))))
+	count, err := s.executeCounting(ctx, statement)
 	if err != nil {
 		return 0, fmt.Errorf("expire broadcast consumers: %w", err)
 	}
@@ -607,10 +627,25 @@ func (s *sqlStore) ExpireBroadcastConsumers(ctx context.Context, cutoff time.Tim
 }
 
 // DeleteSettledMessages removes messages older than the reference that every
-// covering registered consumer has completed.
+// covering registered consumer has completed. Exhausted deliveries do not
+// count as settled: a dead letter pins its message, and so its payload, until
+// Bridge.Resubmit revives it or the hard age cap removes it loudly.
 func (s *sqlStore) DeleteSettledMessages(ctx context.Context, olderThan time.Time) (int64, error) {
-	count, err := s.execCounting(ctx, deleteSettledMessagesStatement,
-		formatTime(olderThan), string(StatusCompleted))
+	c := newConsumerTable("c")
+	d := newDeliveryTable("d")
+	completed := gooq.Select1(gooq.Raw[int64]("1")).From(d).
+		Where(d.MessageID.EQField(gooqMessage.ID).
+			And(d.ListenerID.EQField(c.ListenerID)).
+			And(d.Instance.EQField(c.Instance)).
+			And(d.Status.EQ(string(StatusCompleted))))
+	coveringWithoutCompletion := gooq.Select1(gooq.Raw[int64]("1")).From(c).
+		Where(c.EventType.EQField(gooqMessage.EventType).
+			And(c.StartBoundary.LEField(gooqMessage.PublicationDate)).
+			And(gooq.NotExists(completed)))
+	statement := gooq.DeleteFrom(gooqMessage).
+		Where(gooqMessage.PublicationDate.LT(formatTime(olderThan)).
+			And(gooq.NotExists(coveringWithoutCompletion)))
+	count, err := s.executeCounting(ctx, statement)
 	if err != nil {
 		return 0, fmt.Errorf("delete settled messages: %w", err)
 	}
@@ -622,7 +657,9 @@ func (s *sqlStore) DeleteSettledMessages(ctx context.Context, olderThan time.Tim
 // deliveries would otherwise pin messages forever; the caller reports every
 // non-zero count loudly.
 func (s *sqlStore) DeleteMessagesOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
-	count, err := s.execCounting(ctx, deleteMessagesOlderThanStatement, formatTime(cutoff))
+	statement := gooq.DeleteFrom(gooqMessage).
+		Where(gooqMessage.PublicationDate.LT(formatTime(cutoff)))
+	count, err := s.executeCounting(ctx, statement)
 	if err != nil {
 		return 0, fmt.Errorf("delete messages past the maximum age: %w", err)
 	}
@@ -635,15 +672,48 @@ func (s *sqlStore) DeleteMessagesOlderThan(ctx context.Context, cutoff time.Time
 // the materialization anti-join, so removing them while their message
 // survives would resurrect the message as a fresh delivery.
 func (s *sqlStore) DeleteOrphanDeliveries(ctx context.Context) (int64, error) {
-	withoutMessage, err := s.execCounting(ctx, deleteDeliveriesWithoutMessageStatement)
+	m := newMessageTable("m")
+	withoutMessage := gooq.DeleteFrom(gooqDelivery).
+		Where(gooq.NotExists(
+			gooq.Select1(gooq.Raw[int64]("1")).From(m).
+				Where(m.ID.EQField(gooqDelivery.MessageID))))
+	deletedWithoutMessage, err := s.executeCounting(ctx, withoutMessage)
 	if err != nil {
 		return 0, fmt.Errorf("delete deliveries without a message: %w", err)
 	}
-	withoutConsumer, err := s.execCounting(ctx, deleteDeliveriesWithoutConsumerStatement)
+
+	c := newConsumerTable("c")
+	withoutConsumer := gooq.DeleteFrom(gooqDelivery).
+		Where(gooq.NotExists(
+			gooq.Select1(gooq.Raw[int64]("1")).From(c).
+				Where(c.ListenerID.EQField(gooqDelivery.ListenerID).
+					And(c.Instance.EQField(gooqDelivery.Instance)))))
+	deletedWithoutConsumer, err := s.executeCounting(ctx, withoutConsumer)
 	if err != nil {
-		return withoutMessage, fmt.Errorf("delete deliveries without a consumer: %w", err)
+		return deletedWithoutMessage, fmt.Errorf("delete deliveries without a consumer: %w", err)
 	}
-	return withoutMessage + withoutConsumer, nil
+	return deletedWithoutMessage + deletedWithoutConsumer, nil
+}
+
+// collectDueDeliveries scans every row of a due-delivery projection.
+func collectDueDeliveries(rows *sql.Rows) (deliveries []DueDelivery, err error) {
+	defer func(rows *sql.Rows) {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close due delivery rows: %w", closeErr))
+		}
+	}(rows)
+
+	for rows.Next() {
+		delivery, err := scanDueDelivery(rows)
+		if err != nil {
+			return nil, err
+		}
+		deliveries = append(deliveries, delivery)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return deliveries, nil
 }
 
 func scanDueDelivery(rows *sql.Rows) (DueDelivery, error) {
@@ -755,7 +825,7 @@ var _ Store = (*PostgresStore)(nil)
 
 // NewPostgresStore constructs a PostgresStore on top of an open PostgreSQL
 // database. The schema and queries are the same as the SQLite store; only the
-// migration dialect and the placeholder style differ.
+// rendering dialect and the migration dialect differ.
 func NewPostgresStore(database *sql.DB, options ...Option) *PostgresStore {
 	return &PostgresStore{newSQLStore(database, postgresDialect(), options...)}
 }

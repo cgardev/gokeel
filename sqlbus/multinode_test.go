@@ -2,6 +2,7 @@ package sqlbus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -382,5 +383,82 @@ func TestListenersReceiveOnlyTheirEventType(t *testing.T) {
 	}
 	if got := countRows(t, listenerNode.database, messageTableName); got != 2 {
 		t.Errorf("message rows = %d, want 2", got)
+	}
+}
+
+func TestOrderedListenerProcessesEventsInPublicationOrderAcrossNodes(t *testing.T) {
+	path := newSQLitePath(t)
+	grace := WithMaterializationGrace(50 * time.Millisecond)
+	first := newSQLiteNode(t, path, grace)
+	second := newSQLiteNode(t, path, grace)
+
+	var mu sync.Mutex
+	var order []string
+	failuresLeft := 2
+	record := func(ctx context.Context, event orderPlaced) error {
+		mu.Lock()
+		defer mu.Unlock()
+		// One event in the middle fails twice: the FIFO queue must hold its
+		// successors back cluster-wide and still deliver everything in order.
+		if event.OrderID == "o-3" && failuresLeft > 0 {
+			failuresLeft--
+			return errors.New("transient failure")
+		}
+		order = append(order, event.OrderID)
+		return nil
+	}
+	quickRetry := WithListenerRetryDelay(func(int) time.Duration { return 5 * time.Millisecond })
+	err := AttachCompetingListener(t.Context(), first.bridge, "billing", record,
+		WithOrderedDelivery(), quickRetry)
+	if err != nil {
+		t.Fatalf("attach billing on the first node: %v", err)
+	}
+	err = AttachCompetingListener(t.Context(), second.bridge, "billing", record,
+		WithOrderedDelivery(), quickRetry)
+	if err != nil {
+		t.Fatalf("attach billing on the second node: %v", err)
+	}
+	startDispatcher(t, NewDispatcher(first.bridge, WithPollInterval(5*time.Millisecond)))
+	startDispatcher(t, NewDispatcher(second.bridge, WithPollInterval(5*time.Millisecond)))
+
+	const published = 10
+	for index := range published {
+		origin := first
+		if index%2 == 1 {
+			origin = second
+		}
+		if err := origin.publish(t.Context(), orderPlaced{OrderID: fmt.Sprintf("o-%d", index)}); err != nil {
+			t.Fatalf("publish o-%d: %v", index, err)
+		}
+	}
+
+	waitFor(t, 20*time.Second, "every event is handled in order", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(order) == published
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	for index, orderID := range order {
+		if expected := fmt.Sprintf("o-%d", index); orderID != expected {
+			t.Fatalf("processing order = %v, want strictly ascending publication order", order)
+		}
+	}
+}
+
+func TestConflictingOrderingRegistrationIsRejected(t *testing.T) {
+	path := newSQLitePath(t)
+	first := newSQLiteNode(t, path)
+	second := newSQLiteNode(t, path)
+
+	record := func(ctx context.Context, event orderPlaced) error { return nil }
+	err := AttachCompetingListener(t.Context(), first.bridge, "billing", record, WithOrderedDelivery())
+	if err != nil {
+		t.Fatalf("ordered attachment: %v", err)
+	}
+	err = AttachCompetingListener(t.Context(), second.bridge, "billing", record)
+	if !errors.Is(err, ErrConflictingOrdering) {
+		t.Fatalf("conflicting ordering error = %v, want ErrConflictingOrdering", err)
 	}
 }

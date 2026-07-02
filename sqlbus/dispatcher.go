@@ -247,12 +247,14 @@ func (d *Dispatcher) processAttachment(ctx context.Context, attached attachment)
 
 	// The batch loop is bounded so one pass cannot spin on a backlog that
 	// keeps re-becoming due (for example, instant retries against a failing
-	// listener); whatever remains is picked up by the next pass.
+	// listener); whatever remains is picked up by the next pass. A FIFO
+	// listener yields at most its queue head per query, so the loop walks the
+	// queue strictly in order, one settled delivery at a time.
 	const maximumBatchesPerPass = 16
 	var failures []error
 	for batch := 0; batch < maximumBatchesPerPass; batch++ {
 		now := time.Now().UTC()
-		due, err := d.bridge.store.FindDueDeliveries(ctx, attached.id, instance,
+		due, err := d.bridge.store.FindDueDeliveries(ctx, key, attached.configuration.ordering,
 			now, now.Add(-d.bridge.leaseDuration), d.batchSize)
 		if err != nil {
 			failures = append(failures, err)
@@ -268,11 +270,13 @@ func (d *Dispatcher) processAttachment(ctx context.Context, attached attachment)
 			restore := func() (any, error) {
 				return d.bridge.serializer.Deserialize(work.Message.EventType, work.Message.SerializedEvent)
 			}
-			if err := d.bridge.dispatchDelivery(ctx, work.Delivery.Key, work.Delivery.Attempts, restore); err != nil {
+			err := d.bridge.dispatchDelivery(ctx, attached, work.Delivery.Key,
+				work.Delivery.Attempts, work.Message.PublicationDate, restore)
+			if err != nil {
 				failures = append(failures, err)
 			}
 		}
-		if len(due) < d.batchSize {
+		if attached.configuration.ordering != OrderingFIFO && len(due) < d.batchSize {
 			break
 		}
 	}

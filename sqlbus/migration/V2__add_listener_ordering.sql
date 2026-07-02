@@ -1,0 +1,1 @@
+ALTER TABLE event_message_listener ADD COLUMN ordering TEXT NOT NULL DEFAULT 'UNORDERED';

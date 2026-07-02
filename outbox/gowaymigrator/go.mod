@@ -11,6 +11,7 @@ require (
 require (
 	github.com/cgardev/gokeel/eventbus v0.0.0-00010101000000-000000000000 // indirect
 	github.com/cgardev/gokeel/transaction v0.0.0-00010101000000-000000000000 // indirect
+	github.com/cgardev/gooq v0.0.0-20260531151630-ef8fc4b12d37 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

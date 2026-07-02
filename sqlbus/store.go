@@ -16,6 +16,12 @@ var (
 	// listener as competing and broadcast at the same time, processing every
 	// event twice.
 	ErrConflictingDeliveryMode = errors.New("listener is already registered under a different delivery mode")
+
+	// ErrConflictingOrdering reports an attachment whose ordering disagrees
+	// with the ordering another node already registered for the same
+	// listener. Without this arbitration an unordered node would claim
+	// deliveries out of order behind the back of the FIFO nodes.
+	ErrConflictingOrdering = errors.New("listener is already registered under a different ordering")
 )
 
 // Querier is the minimal execution surface the store runs its statements
@@ -46,22 +52,45 @@ type Store interface {
 	CreateMessage(ctx context.Context, querier Querier, message Message) error
 	CreateDeliveries(ctx context.Context, querier Querier, keys []DeliveryKey) error
 
-	RegisterListenerMode(ctx context.Context, id eventbus.ListenerID, mode DeliveryMode) (DeliveryMode, error)
+	RegisterListenerMode(ctx context.Context, id eventbus.ListenerID,
+		mode DeliveryMode, ordering Ordering) (DeliveryMode, Ordering, error)
 	RegisterConsumer(ctx context.Context, consumer Consumer) error
 	Heartbeat(ctx context.Context, key ConsumerKey, at time.Time) (bool, error)
 	RemoveListener(ctx context.Context, id eventbus.ListenerID) error
 
 	MaterializeDeliveries(ctx context.Context, key ConsumerKey) (int64, error)
 	AdvanceFrontier(ctx context.Context, key ConsumerKey, frontier time.Time) error
-	FindDueDeliveries(ctx context.Context, listener eventbus.ListenerID, instance string,
+
+	// FindDueDeliveries returns the claimable deliveries of the consumer,
+	// oldest publication first. For a FIFO consumer only the head of the
+	// queue is claimable, and only below the materialization frontier, where
+	// the publication order is known to be complete; the total order is
+	// (publication_date, message_id), deterministic across the cluster.
+	FindDueDeliveries(ctx context.Context, key ConsumerKey, ordering Ordering,
 		now time.Time, leaseCutoff time.Time, limit int) ([]DueDelivery, error)
 	FindExhaustedDeliveries(ctx context.Context, limit int) ([]DueDelivery, error)
 
+	// ClaimDelivery atomically transitions a due delivery into processing
+	// under the token, counting the attempt. The attempts value the claimant
+	// observed is re-checked by the update, so it doubles as a fencing
+	// generation: a claim based on a stale read affects zero rows.
 	ClaimDelivery(ctx context.Context, key DeliveryKey, token string,
-		now time.Time, leaseCutoff time.Time) (bool, error)
+		now time.Time, leaseCutoff time.Time, attempts int) (bool, error)
+
+	// ClaimDeliveryInOrder claims like ClaimDelivery but re-verifies inside
+	// the update that no earlier incomplete delivery of the same consumer
+	// exists, so a claim races neither a resubmitted predecessor nor another
+	// node claiming ahead; publicationDate is the position of the claimed
+	// message in the total order.
+	ClaimDeliveryInOrder(ctx context.Context, key DeliveryKey, token string,
+		now time.Time, leaseCutoff time.Time, attempts int, publicationDate time.Time) (bool, error)
 	CompleteDelivery(ctx context.Context, key DeliveryKey, token string, completionDate time.Time) (bool, error)
+
+	// FailDelivery settles a failed delivery under the token fence; attempts
+	// is the attempt count this dispatcher's claim recorded, from which the
+	// exhaustion decision is computed against maximumAttempts.
 	FailDelivery(ctx context.Context, key DeliveryKey, token string, cause string,
-		nextAttemptDate time.Time, maximumAttempts int) (bool, error)
+		nextAttemptDate time.Time, attempts int, maximumAttempts int) (bool, error)
 	ResubmitDelivery(ctx context.Context, key DeliveryKey) (bool, error)
 
 	ExpireBroadcastConsumers(ctx context.Context, cutoff time.Time) (int64, error)

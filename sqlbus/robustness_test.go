@@ -98,7 +98,7 @@ func TestClaimArbitrationLetsExactlyOneClaimantWin(t *testing.T) {
 		go func() {
 			defer group.Done()
 			claimed, err := n.store.ClaimDelivery(t.Context(), key,
-				fmt.Sprintf("token-%d", index), now, now.Add(-time.Hour))
+				fmt.Sprintf("token-%d", index), now, now.Add(-time.Hour), 0)
 			if err != nil {
 				t.Errorf("claim: %v", err)
 				return
@@ -122,14 +122,15 @@ func TestSettlementIsFencedAgainstAStolenClaim(t *testing.T) {
 	key := seedDelivery(t, n)
 	now := time.Now().UTC()
 
-	claimed, err := n.store.ClaimDelivery(t.Context(), key, "zombie", now, now.Add(-time.Hour))
+	claimed, err := n.store.ClaimDelivery(t.Context(), key, "zombie", now, now.Add(-time.Hour), 0)
 	if err != nil || !claimed {
 		t.Fatalf("first claim = %v, %v; want a successful claim", claimed, err)
 	}
 
 	// A lease cutoff in the future treats the first claim as expired, which
-	// is how another node steals a delivery whose dispatcher stalled.
-	stolen, err := n.store.ClaimDelivery(t.Context(), key, "thief", now, now.Add(time.Second))
+	// is how another node steals a delivery whose dispatcher stalled. The
+	// thief observed the zombie's attempt count when it found the delivery.
+	stolen, err := n.store.ClaimDelivery(t.Context(), key, "thief", now, now.Add(time.Second), 1)
 	if err != nil || !stolen {
 		t.Fatalf("stealing claim = %v, %v; want a successful steal", stolen, err)
 	}
@@ -141,7 +142,7 @@ func TestSettlementIsFencedAgainstAStolenClaim(t *testing.T) {
 	if settled {
 		t.Fatal("a zombie settlement with a stolen token affected rows")
 	}
-	failed, err := n.store.FailDelivery(t.Context(), key, "zombie", "late failure", now, 5)
+	failed, err := n.store.FailDelivery(t.Context(), key, "zombie", "late failure", now, 1, 5)
 	if err != nil {
 		t.Fatalf("zombie failure: %v", err)
 	}
@@ -426,5 +427,83 @@ func TestConcurrentPublishersDeliverEveryEvent(t *testing.T) {
 		if count != 1 {
 			t.Errorf("order %s was handled %d times, want exactly 1", order, count)
 		}
+	}
+}
+
+func TestOrderedClaimStaysSerialAgainstARevivedPredecessor(t *testing.T) {
+	n := newSQLiteNode(t, newSQLitePath(t))
+
+	record := func(ctx context.Context, event orderPlaced) error { return nil }
+	err := AttachCompetingListener(t.Context(), n.bridge, "billing", record, WithOrderedDelivery())
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	first := Message{
+		ID:              uuid.New(),
+		EventType:       "order.placed",
+		SerializedEvent: `{"OrderID":"o-first"}`,
+		PublisherNode:   "seed",
+		PublicationDate: time.Now().UTC().Add(-time.Minute),
+	}
+	second := Message{
+		ID:              uuid.New(),
+		EventType:       "order.placed",
+		SerializedEvent: `{"OrderID":"o-second"}`,
+		PublisherNode:   "seed",
+		PublicationDate: time.Now().UTC(),
+	}
+	for _, message := range []Message{first, second} {
+		if err := n.store.CreateMessage(t.Context(), n.database, message); err != nil {
+			t.Fatalf("create message: %v", err)
+		}
+	}
+	firstKey := DeliveryKey{MessageID: first.ID, ListenerID: "billing"}
+	secondKey := DeliveryKey{MessageID: second.ID, ListenerID: "billing"}
+	if err := n.store.CreateDeliveries(t.Context(), n.database, []DeliveryKey{firstKey, secondKey}); err != nil {
+		t.Fatalf("create deliveries: %v", err)
+	}
+
+	now := time.Now().UTC()
+	leaseCutoff := now.Add(-time.Hour)
+
+	// The predecessor exhausts its budget and parks, so the successor's
+	// ordered claim proceeds past it.
+	claimed, err := n.store.ClaimDeliveryInOrder(t.Context(), firstKey, "one", now, leaseCutoff, 0, first.PublicationDate)
+	if err != nil || !claimed {
+		t.Fatalf("claim of the predecessor = %v, %v, want true", claimed, err)
+	}
+	settled, err := n.store.FailDelivery(t.Context(), firstKey, "one", "poison", now, 1, 1)
+	if err != nil || !settled {
+		t.Fatalf("exhaustion of the predecessor = %v, %v, want true", settled, err)
+	}
+	claimed, err = n.store.ClaimDeliveryInOrder(t.Context(), secondKey, "two", now, leaseCutoff, 0, second.PublicationDate)
+	if err != nil || !claimed {
+		t.Fatalf("claim of the successor = %v, %v, want true", claimed, err)
+	}
+
+	// An operator revives the dead letter while the successor is still
+	// processing: the revived predecessor must wait, or two deliveries of one
+	// FIFO consumer would run concurrently.
+	revived, err := n.store.ResubmitDelivery(t.Context(), firstKey)
+	if err != nil || !revived {
+		t.Fatalf("resubmission = %v, %v, want true", revived, err)
+	}
+	claimed, err = n.store.ClaimDeliveryInOrder(t.Context(), firstKey, "three", now, leaseCutoff, 0, first.PublicationDate)
+	if err != nil {
+		t.Fatalf("claim of the revived predecessor: %v", err)
+	}
+	if claimed {
+		t.Fatal("a revived predecessor was claimable while its successor was processing")
+	}
+
+	// Once the successor settles, the revived predecessor proceeds.
+	settled, err = n.store.CompleteDelivery(t.Context(), secondKey, "two", now)
+	if err != nil || !settled {
+		t.Fatalf("completion of the successor = %v, %v, want true", settled, err)
+	}
+	claimed, err = n.store.ClaimDeliveryInOrder(t.Context(), firstKey, "four", now, leaseCutoff, 0, first.PublicationDate)
+	if err != nil || !claimed {
+		t.Fatalf("claim of the revived predecessor after settlement = %v, %v, want true", claimed, err)
 	}
 }

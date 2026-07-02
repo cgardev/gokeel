@@ -37,9 +37,79 @@ type EventBus interface {
 // attachment is the in-memory record of one listener this node hosts: the
 // dispatcher materializes, claims, and delivers only for attached listeners.
 type attachment struct {
-	id        eventbus.ListenerID
-	mode      DeliveryMode
-	eventType string
+	id            eventbus.ListenerID
+	mode          DeliveryMode
+	eventType     string
+	configuration attachmentConfiguration
+}
+
+// attachmentConfiguration is the per-listener delivery behavior. The zero
+// value defers to the bridge-level defaults.
+type attachmentConfiguration struct {
+	ordering        Ordering
+	maximumAttempts int
+	retryDelay      func(attempt int) time.Duration
+}
+
+// AttachOption customizes one listener at attachment time.
+type AttachOption func(*attachmentConfiguration)
+
+// WithOrderedDelivery attaches the listener as a FIFO consumer: its events
+// are processed strictly in publication order, one at a time, cluster-wide
+// for a competing listener and per node for a broadcast one. Ordered
+// deliveries wait below the materialization frontier, so their latency is at
+// least the materialization grace; every node must attach the listener with
+// the same ordering.
+func WithOrderedDelivery() AttachOption {
+	return func(c *attachmentConfiguration) {
+		c.ordering = OrderingFIFO
+	}
+}
+
+// WithListenerMaximumAttempts overrides, for this listener, how many delivery
+// attempts a delivery may consume before it becomes exhausted. Configure the
+// same value on every node hosting the listener.
+func WithListenerMaximumAttempts(attempts int) AttachOption {
+	return func(c *attachmentConfiguration) {
+		if attempts > 0 {
+			c.maximumAttempts = attempts
+		}
+	}
+}
+
+// WithListenerRetryDelay overrides, for this listener, the backoff schedule
+// of failed deliveries. Configure the same schedule on every node hosting the
+// listener.
+func WithListenerRetryDelay(delay func(attempt int) time.Duration) AttachOption {
+	return func(c *attachmentConfiguration) {
+		if delay != nil {
+			c.retryDelay = delay
+		}
+	}
+}
+
+// AttachmentRegistration describes one listener to Attach: the untyped seam
+// the typed attachment functions and the Broker adapter both go through.
+type AttachmentRegistration struct {
+	// ID identifies the listener; it must be unique within the bus.
+	ID eventbus.ListenerID
+
+	// Matches decides which events the listener receives on the local bus.
+	Matches func(event any) bool
+
+	// Probe carries the zero value of the consumed event type, so the bridge
+	// resolves the persistent event type name through its serializer without
+	// invoking the handler.
+	Probe any
+
+	// Handle processes one delivered event.
+	Handle eventbus.Handler
+
+	// Mode selects competing or broadcast consumption.
+	Mode DeliveryMode
+
+	// Options carry the per-listener delivery behavior.
+	Options []AttachOption
 }
 
 // Bridge connects the local in-process bus to the shared database: it stores
@@ -169,7 +239,7 @@ func defaultRetryDelay(attempt int) time.Duration {
 
 // AttachCompetingListener subscribes the listener on the local bus and
 // registers it as the competing consumer of every event of type T: each
-// event is processed exactly once cluster-wide, by whichever hosting node
+// event is delivered exactly once cluster-wide, by whichever hosting node
 // claims it first. T must already be registered on the serializer.
 //
 // A freshly attached listener starts at the attachment time minus the
@@ -180,8 +250,9 @@ func AttachCompetingListener[T any](
 	bridge *Bridge,
 	id eventbus.ListenerID,
 	handle func(ctx context.Context, event T) error,
+	options ...AttachOption,
 ) error {
-	return attachListener(ctx, bridge, id, DeliveryModeCompeting, handle)
+	return attachTyped(ctx, bridge, id, DeliveryModeCompeting, handle, options)
 }
 
 // AttachBroadcastListener subscribes the listener on the local bus and
@@ -194,42 +265,82 @@ func AttachBroadcastListener[T any](
 	bridge *Bridge,
 	id eventbus.ListenerID,
 	handle func(ctx context.Context, event T) error,
+	options ...AttachOption,
 ) error {
-	return attachListener(ctx, bridge, id, DeliveryModeBroadcast, handle)
+	return attachTyped(ctx, bridge, id, DeliveryModeBroadcast, handle, options)
 }
 
-func attachListener[T any](
+// attachTyped assembles the untyped registration from the type parameter and
+// hands it to Attach.
+func attachTyped[T any](
 	ctx context.Context,
 	bridge *Bridge,
 	id eventbus.ListenerID,
 	mode DeliveryMode,
 	handle func(ctx context.Context, event T) error,
+	options []AttachOption,
 ) error {
+	var probe T
+	return bridge.Attach(ctx, AttachmentRegistration{
+		ID: id,
+		Matches: func(event any) bool {
+			_, ok := event.(T)
+			return ok
+		},
+		Probe: probe,
+		Handle: func(ctx context.Context, event any) error {
+			typed, ok := event.(T)
+			if !ok {
+				return fmt.Errorf("listener %s received an event of unexpected type %T", id, event)
+			}
+			return handle(ctx, typed)
+		},
+		Mode:    mode,
+		Options: options,
+	})
+}
+
+// Attach subscribes the listener on the local bus and registers it durably
+// under its delivery mode and ordering. It is the untyped seam the typed
+// attachment functions and the Broker adapter go through.
+func (b *Bridge) Attach(ctx context.Context, registration AttachmentRegistration) error {
+	id := registration.ID
+	configuration := attachmentConfiguration{
+		ordering:        OrderingUnordered,
+		maximumAttempts: b.maximumAttempts,
+		retryDelay:      b.retryDelay,
+	}
+	for _, option := range registration.Options {
+		option(&configuration)
+	}
+
 	// Serializing the zero value resolves the persistent event type name and
 	// rejects an attachment whose type was never registered, before any
 	// durable row is written.
-	var probe T
-	eventType, _, err := bridge.serializer.Serialize(probe)
+	eventType, _, err := b.serializer.Serialize(registration.Probe)
 	if err != nil {
 		return fmt.Errorf("attach %s: %w", id, err)
 	}
 
-	bridge.mu.Lock()
-	for _, existing := range bridge.attachments {
+	b.mu.Lock()
+	for _, existing := range b.attachments {
 		if existing.id == id {
-			bridge.mu.Unlock()
+			b.mu.Unlock()
 			return fmt.Errorf("%w: %s", eventbus.ErrDuplicateListener, id)
 		}
 	}
-	alreadySubscribed := bridge.subscribed[id]
-	bridge.mu.Unlock()
+	alreadySubscribed := b.subscribed[id]
+	b.mu.Unlock()
 
-	winner, err := bridge.store.RegisterListenerMode(ctx, id, mode)
+	modeWinner, orderingWinner, err := b.store.RegisterListenerMode(ctx, id, registration.Mode, configuration.ordering)
 	if err != nil {
 		return err
 	}
-	if winner != mode {
-		return fmt.Errorf("%w: %s is registered as %s", ErrConflictingDeliveryMode, id, winner)
+	if modeWinner != registration.Mode {
+		return fmt.Errorf("%w: %s is registered as %s", ErrConflictingDeliveryMode, id, modeWinner)
+	}
+	if orderingWinner != configuration.ordering {
+		return fmt.Errorf("%w: %s is registered as %s", ErrConflictingOrdering, id, orderingWinner)
 	}
 
 	// The local subscription comes before the durable consumer registration:
@@ -239,33 +350,21 @@ func attachListener[T any](
 	// left over from an Attach that failed later is reused, so the attachment
 	// can be retried after a transient failure.
 	if !alreadySubscribed {
-		err = bridge.bus.Subscribe(id,
-			func(event any) bool {
-				_, ok := event.(T)
-				return ok
-			},
-			func(ctx context.Context, event any) error {
-				typed, ok := event.(T)
-				if !ok {
-					return fmt.Errorf("listener %s received an event of unexpected type %T", id, event)
-				}
-				return handle(ctx, typed)
-			})
-		if err != nil {
+		if err := b.bus.Subscribe(id, registration.Matches, registration.Handle); err != nil {
 			return err
 		}
-		bridge.mu.Lock()
-		bridge.subscribed[id] = true
-		bridge.mu.Unlock()
+		b.mu.Lock()
+		b.subscribed[id] = true
+		b.mu.Unlock()
 	}
 
 	now := time.Now().UTC()
-	boundary := now.Add(-bridge.materializationGrace)
-	if err := bridge.store.RegisterConsumer(ctx, Consumer{
+	boundary := now.Add(-b.materializationGrace)
+	if err := b.store.RegisterConsumer(ctx, Consumer{
 		ListenerID:       id,
-		Instance:         bridge.instanceFor(mode),
+		Instance:         b.instanceFor(registration.Mode),
 		EventType:        eventType,
-		DeliveryMode:     mode,
+		DeliveryMode:     registration.Mode,
 		StartBoundary:    boundary,
 		Frontier:         boundary,
 		RegistrationDate: now,
@@ -274,10 +373,28 @@ func attachListener[T any](
 		return err
 	}
 
-	bridge.mu.Lock()
-	defer bridge.mu.Unlock()
-	bridge.attachments = append(bridge.attachments, attachment{id: id, mode: mode, eventType: eventType})
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.attachments = append(b.attachments, attachment{
+		id:            id,
+		mode:          registration.Mode,
+		eventType:     eventType,
+		configuration: configuration,
+	})
 	return nil
+}
+
+// attachmentFor returns the attachment of the listener, reporting false when
+// the listener is not attached on this node.
+func (b *Bridge) attachmentFor(id eventbus.ListenerID) (attachment, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, attached := range b.attachments {
+		if attached.id == id {
+			return attached, true
+		}
+	}
+	return attachment{}, false
 }
 
 // Detach removes the durable registrations of the listener, unpinning its
@@ -398,14 +515,21 @@ func (b *Bridge) localDeliveryKeys(message Message) []DeliveryKey {
 }
 
 // dispatchLocal claims and delivers the given deliveries with the in-memory
-// event, the Publisher's after-commit fast path. The returned error joins the
-// failures of every delivery that could not be completed; those deliveries
-// stay claimable and are recovered by a Dispatcher.
+// event, the Publisher's after-commit fast path. FIFO listeners are skipped:
+// their deliveries must wait below the materialization frontier, where the
+// publication order is complete, so their own Dispatcher serves them. The
+// returned error joins the failures of every delivery that could not be
+// completed; those deliveries stay claimable and are recovered by a
+// Dispatcher.
 func (b *Bridge) dispatchLocal(ctx context.Context, event any, keys []DeliveryKey) error {
 	var failures []error
 	for _, key := range keys {
+		attached, found := b.attachmentFor(key.ListenerID)
+		if !found || attached.configuration.ordering == OrderingFIFO {
+			continue
+		}
 		restore := func() (any, error) { return event, nil }
-		if err := b.dispatchDelivery(ctx, key, 0, restore); err != nil {
+		if err := b.dispatchDelivery(ctx, attached, key, 0, time.Time{}, restore); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -414,20 +538,36 @@ func (b *Bridge) dispatchLocal(ctx context.Context, event any, keys []DeliveryKe
 
 // dispatchDelivery runs one delivery through the state machine: claim it
 // under a fresh token, restore the event, deliver through the local bus, and
-// settle the outcome. An unclaimable delivery is another dispatcher's work
-// and reports no error. Settlements run on a bounded context that survives
-// the caller's cancellation, so a shutdown mid-delivery cannot strand a
-// processing row until its lease expires, and a wedged settlement cannot
-// hold a stopping dispatcher forever.
+// settle the outcome. A FIFO listener's delivery is claimed with the ordered
+// claim, which re-verifies the head-of-line condition at its publication
+// position. An unclaimable delivery is another dispatcher's work and reports
+// no error. Settlements run on a bounded context that survives the caller's
+// cancellation, so a shutdown mid-delivery cannot strand a processing row
+// until its lease expires, and a wedged settlement cannot hold a stopping
+// dispatcher forever.
 func (b *Bridge) dispatchDelivery(
 	ctx context.Context,
+	attached attachment,
 	key DeliveryKey,
 	attemptsBeforeClaim int,
+	publicationDate time.Time,
 	restore func() (any, error),
 ) error {
+	// The attachment travels from the caller's snapshot, so the claim-mode
+	// selection and the retry policy of one dispatch always agree.
+	configuration := attached.configuration
+
 	token := uuid.NewString()
 	now := time.Now().UTC()
-	claimed, err := b.store.ClaimDelivery(ctx, key, token, now, now.Add(-b.leaseDuration))
+	leaseCutoff := now.Add(-b.leaseDuration)
+	var claimed bool
+	var err error
+	if configuration.ordering == OrderingFIFO {
+		claimed, err = b.store.ClaimDeliveryInOrder(
+			ctx, key, token, now, leaseCutoff, attemptsBeforeClaim, publicationDate)
+	} else {
+		claimed, err = b.store.ClaimDelivery(ctx, key, token, now, leaseCutoff, attemptsBeforeClaim)
+	}
 	if err != nil {
 		return err
 	}
@@ -453,11 +593,12 @@ func (b *Bridge) dispatchDelivery(
 			return deliveryError
 		}
 		attempt := attemptsBeforeClaim + 1
-		nextAttemptDate := time.Now().UTC().Add(b.retryDelay(attempt))
+		nextAttemptDate := time.Now().UTC().Add(configuration.retryDelay(attempt))
 		settleContext, settleCancel := settlementContext(ctx)
 		defer settleCancel()
 		settled, markError := b.store.FailDelivery(
-			settleContext, key, token, err.Error(), nextAttemptDate, b.maximumAttempts,
+			settleContext, key, token, err.Error(), nextAttemptDate,
+			attempt, configuration.maximumAttempts,
 		)
 		if markError != nil {
 			return errors.Join(deliveryError, markError)

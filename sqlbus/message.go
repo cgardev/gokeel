@@ -53,6 +53,25 @@ const (
 	DeliveryModeBroadcast DeliveryMode = "BROADCAST"
 )
 
+// Ordering selects how the deliveries of one listener are worked through.
+type Ordering string
+
+const (
+	// OrderingUnordered processes the deliveries of the listener as they
+	// become due, with no ordering guarantee: a failing delivery retries on
+	// its own schedule without delaying the others.
+	OrderingUnordered Ordering = "UNORDERED"
+
+	// OrderingFIFO processes the deliveries of the listener strictly in
+	// publication order, one at a time per consumer, cluster-wide for a
+	// competing listener and per node for a broadcast one. A failing delivery
+	// blocks its successors while it retries; once it exhausts its attempt
+	// budget it parks as a dead letter and the queue continues. Ordered
+	// deliveries wait below the materialization frontier, so their latency is
+	// at least the materialization grace.
+	OrderingFIFO Ordering = "FIFO"
+)
+
 // Status models the lifecycle of one delivery.
 type Status string
 
