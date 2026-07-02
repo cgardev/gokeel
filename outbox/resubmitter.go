@@ -15,9 +15,14 @@ type Resubmitter struct {
 	minimumAge time.Duration
 }
 
-// NewResubmitter constructs a Resubmitter that runs one resubmission pass
-// per interval, considering only publications older than minimumAge so it
-// does not race against dispatches that are still in flight.
+// NewResubmitter constructs a Resubmitter that runs one resubmission pass per
+// interval, considering only publications whose latest delivery attempt is
+// older than minimumAge so it does not race against dispatches that are still
+// in flight. Configure minimumAge above the slowest listener: resubmitting an
+// attempt that is still running fences the running dispatcher out and repeats
+// its work. Attempt ages compare wall clocks across application instances, so
+// clock skew between instances subtracts from the effective grace; keep the
+// instances synchronized and the skew allowance inside minimumAge.
 func NewResubmitter(registry *Registry, interval, minimumAge time.Duration) *Resubmitter {
 	return &Resubmitter{registry: registry, interval: interval, minimumAge: minimumAge}
 }

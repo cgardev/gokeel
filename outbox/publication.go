@@ -50,9 +50,20 @@ type Publication struct {
 	// for resubmission; it is never persisted as such.
 	Event any
 
-	PublicationDate      time.Time
-	CompletionDate       *time.Time
-	Status               Status
-	CompletionAttempts   int
+	PublicationDate time.Time
+	CompletionDate  *time.Time
+	Status          Status
+
+	// CompletionAttempts counts the delivery attempts of the publication,
+	// starting at one for the initial dispatch and incremented on every
+	// resubmission. It doubles as the fencing generation: a dispatcher settles
+	// its outcome only while the counter still holds the value under which it
+	// claimed the publication.
+	CompletionAttempts int
+
+	// LastResubmissionDate records when the latest delivery attempt started.
+	// It is seeded with the publication date and overwritten on every
+	// resubmission, so the resubmitter measures its grace window against the
+	// attempt in flight, not against the original publication.
 	LastResubmissionDate *time.Time
 }

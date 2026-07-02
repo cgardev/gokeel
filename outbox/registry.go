@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/cgardev/gokeel/eventbus"
@@ -24,6 +25,14 @@ type EventBus interface {
 // through the bus. It does not own the transaction; the Publisher writes the
 // publications inside a unit of work and defers their delivery to after the
 // commit.
+//
+// Publications follow the Spring Modulith lifecycle: created as published
+// with one completion attempt counted, claimed into processing, and settled
+// as completed or failed; a failed publication re-enters delivery only
+// through the compare-and-set resubmission, which increments the attempt
+// counter. Every transition is additionally fenced by the attempt generation,
+// so concurrent registries on separate application instances never overwrite
+// each other's outcomes.
 //
 // A Registry is immutable after construction and safe for concurrent use.
 // Delivery is at-least-once: a crash or failure between delivering an event
@@ -62,14 +71,19 @@ func (r *Registry) Publish(ctx context.Context, querier Querier, event any) ([]P
 		if err != nil {
 			return nil, fmt.Errorf("generate publication identifier: %w", err)
 		}
+		// The initial dispatch is the first completion attempt and the last
+		// resubmission date starts at the publication date, mirroring how the
+		// Spring Modulith repository seeds a new publication row.
 		publication := Publication{
-			ID:              id,
-			ListenerID:      listener,
-			EventType:       eventType,
-			SerializedEvent: payload,
-			Event:           event,
-			PublicationDate: now,
-			Status:          StatusPublished,
+			ID:                   id,
+			ListenerID:           listener,
+			EventType:            eventType,
+			SerializedEvent:      payload,
+			Event:                event,
+			PublicationDate:      now,
+			Status:               StatusPublished,
+			CompletionAttempts:   1,
+			LastResubmissionDate: &now,
 		}
 		if err := r.store.Create(ctx, querier, publication); err != nil {
 			return nil, err
@@ -94,7 +108,7 @@ func (r *Registry) Dispatch(ctx context.Context, publications ...Publication) er
 }
 
 func (r *Registry) dispatch(ctx context.Context, publication Publication) error {
-	claimed, err := r.store.ClaimProcessing(ctx, publication.ID)
+	claimed, err := r.store.ClaimProcessing(ctx, publication.ID, publication.CompletionAttempts)
 	if err != nil {
 		return err
 	}
@@ -107,20 +121,43 @@ func (r *Registry) dispatch(ctx context.Context, publication Publication) error 
 		deliveryError := fmt.Errorf(
 			"deliver %s to %s: %w", publication.EventType, publication.ListenerID, err,
 		)
-		if markError := r.store.MarkFailed(ctx, publication.ID); markError != nil {
+		settled, markError := r.store.MarkFailed(ctx, publication.ID, publication.CompletionAttempts)
+		if markError != nil {
 			return errors.Join(deliveryError, markError)
+		}
+		if !settled {
+			r.reportFencedSettlement(publication)
 		}
 		return deliveryError
 	}
 
-	return r.store.MarkCompleted(ctx, publication.ID, time.Now().UTC())
+	settled, err := r.store.MarkCompleted(
+		ctx, publication.ID, publication.CompletionAttempts, time.Now().UTC(),
+	)
+	if err != nil {
+		return err
+	}
+	if !settled {
+		r.reportFencedSettlement(publication)
+	}
+	return nil
+}
+
+// reportFencedSettlement surfaces a settlement that affected zero rows: the
+// publication was resubmitted while this dispatcher was delivering it, so the
+// listener's work was, or will be, repeated by the new holder. A recurring
+// report means the resubmission grace is shorter than the slowest listener.
+func (r *Registry) reportFencedSettlement(publication Publication) {
+	slog.Warn("publication settlement was fenced out by a concurrent resubmission",
+		"publication", publication.ID, "listener", publication.ListenerID)
 }
 
 // ResubmitIncomplete re-delivers every incomplete publication, restoring the
 // event from its serialized representation. When olderThan is positive, only
-// publications published before that age are considered, which avoids racing
-// against publications that are still being dispatched. The returned error
-// joins the failures of every publication that could not be re-delivered.
+// publications whose latest delivery attempt started before that age are
+// considered, which avoids racing against dispatches that are still in
+// flight. The returned error joins the failures of every publication that
+// could not be re-delivered.
 func (r *Registry) ResubmitIncomplete(ctx context.Context, olderThan time.Duration) error {
 	var publications []Publication
 	var err error
@@ -148,8 +185,22 @@ func (r *Registry) resubmit(ctx context.Context, publication Publication) error 
 	if err != nil {
 		return err
 	}
+	publication.Event = event
 
-	resubmitted, err := r.store.MarkResubmitted(ctx, publication.ID, time.Now().UTC())
+	// A publication read in the resubmitted state was abandoned by a
+	// dispatcher that crashed between resubmitting and claiming it, so it is
+	// dispatched directly under the generation it already carries. A live
+	// claimer racing this dispatch is harmless: the claim admits one winner.
+	if publication.Status == StatusResubmitted {
+		return r.dispatch(ctx, publication)
+	}
+
+	// The resubmission carries the attempts value this pass observed as
+	// stale, so it cannot fence a fresher attempt that a peer started after
+	// the observation.
+	attempts, resubmitted, err := r.store.MarkResubmitted(
+		ctx, publication.ID, publication.CompletionAttempts, time.Now().UTC(),
+	)
 	if err != nil {
 		return err
 	}
@@ -157,6 +208,6 @@ func (r *Registry) resubmit(ctx context.Context, publication Publication) error 
 		return nil
 	}
 
-	publication.Event = event
+	publication.CompletionAttempts = attempts
 	return r.dispatch(ctx, publication)
 }

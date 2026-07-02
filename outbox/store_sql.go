@@ -3,6 +3,7 @@ package outbox
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -40,39 +41,52 @@ const selectColumns = "id, listener_id, event_type, serialized_event, publicatio
 // The statements are written with positional ? placeholders and rebound to the
 // driver's placeholder style by the dialect, mirroring the shape of the Spring
 // Modulith JdbcEventPublicationRepository queries.
+// Every transition a dispatcher performs is guarded by both the status the
+// row must be in and the completion_attempts generation the dispatcher holds,
+// so a dispatcher that lost its publication to a resubmission affects zero
+// rows instead of overwriting the outcome of the current holder.
 const (
 	insertPublicationStatement = "INSERT INTO " + tableName + " " +
-		"(id, listener_id, event_type, serialized_event, publication_date, status, completion_attempts) " +
-		"VALUES (?, ?, ?, ?, ?, ?, ?)"
+		"(id, listener_id, event_type, serialized_event, publication_date, status, " +
+		"completion_attempts, last_resubmission_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
 
-	claimProcessingStatement = "UPDATE " + tableName + " SET status = ? " +
-		"WHERE id = ? AND status NOT IN (?, ?)"
+	// The claim also stamps the attempt start: an attempt recovered from an
+	// abandoned resubmitted row would otherwise inherit a date that is already
+	// past the resubmitter grace, leaving the recovery without protection.
+	claimProcessingStatement = "UPDATE " + tableName + " " +
+		"SET status = ?, last_resubmission_date = ? " +
+		"WHERE id = ? AND status IN (?, ?) AND completion_attempts = ?"
 
-	markFailedStatement = "UPDATE " + tableName + " SET status = ? WHERE id = ? AND status != ?"
+	markFailedStatement = "UPDATE " + tableName + " SET status = ? " +
+		"WHERE id = ? AND status = ? AND completion_attempts = ?"
 
 	markCompletedStatement = "UPDATE " + tableName + " " +
-		"SET status = ?, completion_date = ? WHERE id = ?"
+		"SET status = ?, completion_date = ? WHERE id = ? AND status = ? AND completion_attempts = ?"
 
-	deletePublicationStatement = "DELETE FROM " + tableName + " WHERE id = ?"
+	deleteProcessingStatement = "DELETE FROM " + tableName + " " +
+		"WHERE id = ? AND status = ? AND completion_attempts = ?"
 
-	selectForArchiveStatement = "SELECT " + selectColumns + " FROM " + tableName + " WHERE id = ?"
+	selectForArchiveStatement = "SELECT " + selectColumns + " FROM " + tableName + " " +
+		"WHERE id = ? AND status = ? AND completion_attempts = ?"
 
 	insertArchiveStatement = "INSERT INTO " + archiveTableName + " " +
 		"(id, listener_id, event_type, serialized_event, publication_date, completion_date, status, " +
 		"completion_attempts, last_resubmission_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING"
 
-	selectAttemptsStatement = "SELECT completion_attempts FROM " + tableName + " " +
-		"WHERE id = ? AND status NOT IN (?, ?)"
-
 	markResubmittedStatement = "UPDATE " + tableName + " " +
 		"SET status = ?, completion_attempts = ?, last_resubmission_date = ? " +
-		"WHERE id = ? AND status NOT IN (?, ?) AND completion_attempts = ?"
+		"WHERE id = ? AND status IN (?, ?, ?) AND completion_attempts = ?"
 
 	findIncompleteStatement = "SELECT " + selectColumns + " FROM " + tableName + " " +
 		"WHERE status != ? ORDER BY publication_date ASC"
 
+	// The age cutoff compares against the latest attempt, not the original
+	// publication, so the grace window of the resubmitter protects every
+	// in-flight dispatch. COALESCE covers rows created before the last
+	// resubmission date was seeded at creation time.
 	findIncompleteBeforeStatement = "SELECT " + selectColumns + " FROM " + tableName + " " +
-		"WHERE status != ? AND publication_date < ? ORDER BY publication_date ASC"
+		"WHERE status != ? AND COALESCE(last_resubmission_date, publication_date) < ? " +
+		"ORDER BY publication_date ASC"
 )
 
 // dialect captures the per-database differences the store needs at query time:
@@ -188,6 +202,7 @@ func (s *sqlStore) Create(ctx context.Context, querier Querier, publication Publ
 		formatTime(publication.PublicationDate),
 		string(publication.Status),
 		int64(publication.CompletionAttempts),
+		nullableTime(publication.LastResubmissionDate),
 	)
 	if err != nil {
 		return fmt.Errorf("persist publication %s: %w", publication.ID, err)
@@ -195,12 +210,17 @@ func (s *sqlStore) Create(ctx context.Context, querier Querier, publication Publ
 	return nil
 }
 
-// ClaimProcessing atomically transitions the publication into processing. The
-// status guard makes the update succeed for exactly one of several concurrent
-// dispatchers; the losers observe zero affected rows.
-func (s *sqlStore) ClaimProcessing(ctx context.Context, id uuid.UUID) (bool, error) {
+// ClaimProcessing atomically transitions a published or resubmitted publication
+// of the given attempt generation into processing, stamping the attempt start
+// so the resubmitter grace protects the claimed delivery. The status and
+// generation guards make the update succeed for exactly one of several
+// concurrent dispatchers; the losers observe zero affected rows. A failed
+// publication is not claimable: it re-enters delivery only through
+// MarkResubmitted.
+func (s *sqlStore) ClaimProcessing(ctx context.Context, id uuid.UUID, attempts int) (bool, error) {
 	result, err := s.exec(ctx, s.database, claimProcessingStatement,
-		string(StatusProcessing), id.String(), string(StatusProcessing), string(StatusCompleted))
+		string(StatusProcessing), formatTime(time.Now().UTC()), id.String(),
+		string(StatusPublished), string(StatusResubmitted), int64(attempts))
 	if err != nil {
 		return false, fmt.Errorf("claim publication %s: %w", id, err)
 	}
@@ -211,54 +231,85 @@ func (s *sqlStore) ClaimProcessing(ctx context.Context, id uuid.UUID) (bool, err
 	return affected > 0, nil
 }
 
-// MarkFailed records that processing the publication failed, leaving it
-// incomplete for a later resubmission.
-func (s *sqlStore) MarkFailed(ctx context.Context, id uuid.UUID) error {
-	_, err := s.exec(ctx, s.database, markFailedStatement,
-		string(StatusFailed), id.String(), string(StatusCompleted))
+// MarkFailed records that processing the publication of the given attempt
+// generation failed, leaving it for a later resubmission. It reports false when
+// the publication was fenced out by a concurrent resubmission or settlement.
+func (s *sqlStore) MarkFailed(ctx context.Context, id uuid.UUID, attempts int) (bool, error) {
+	result, err := s.exec(ctx, s.database, markFailedStatement,
+		string(StatusFailed), id.String(), string(StatusProcessing), int64(attempts))
 	if err != nil {
-		return fmt.Errorf("mark publication %s as failed: %w", id, err)
+		return false, fmt.Errorf("mark publication %s as failed: %w", id, err)
 	}
-	return nil
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("inspect failure mark of publication %s: %w", id, err)
+	}
+	return affected > 0, nil
 }
 
-// MarkCompleted settles the publication according to the completion mode of the
-// store.
-func (s *sqlStore) MarkCompleted(ctx context.Context, id uuid.UUID, completionDate time.Time) error {
+// MarkCompleted settles the processing publication of the given attempt
+// generation according to the completion mode of the store. It reports false
+// when the publication was fenced out by a concurrent resubmission.
+func (s *sqlStore) MarkCompleted(
+	ctx context.Context, id uuid.UUID, attempts int, completionDate time.Time,
+) (bool, error) {
 	switch s.completionMode {
 	case CompletionModeDelete:
-		_, err := s.exec(ctx, s.database, deletePublicationStatement, id.String())
+		result, err := s.exec(ctx, s.database, deleteProcessingStatement,
+			id.String(), string(StatusProcessing), int64(attempts))
 		if err != nil {
-			return fmt.Errorf("delete completed publication %s: %w", id, err)
+			return false, fmt.Errorf("delete completed publication %s: %w", id, err)
 		}
-		return nil
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("inspect deletion of publication %s: %w", id, err)
+		}
+		return affected > 0, nil
 	case CompletionModeArchive:
-		return s.archive(ctx, id, completionDate)
+		return s.archive(ctx, id, attempts, completionDate)
 	default:
-		_, err := s.exec(ctx, s.database, markCompletedStatement,
-			string(StatusCompleted), formatTime(completionDate), id.String())
+		result, err := s.exec(ctx, s.database, markCompletedStatement,
+			string(StatusCompleted), formatTime(completionDate),
+			id.String(), string(StatusProcessing), int64(attempts))
 		if err != nil {
-			return fmt.Errorf("mark publication %s as completed: %w", id, err)
+			return false, fmt.Errorf("mark publication %s as completed: %w", id, err)
 		}
-		return nil
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("inspect completion of publication %s: %w", id, err)
+		}
+		return affected > 0, nil
 	}
 }
 
-// archive moves the publication into the archive table as an idempotent sequence
-// rather than a read-then-write transaction: the conflict-tolerant insert lets
-// concurrent or repeated completions of the same publication converge instead of
-// failing, and a crash between the two statements only leaves the source row
-// behind, where resubmission settles it again.
-func (s *sqlStore) archive(ctx context.Context, id uuid.UUID, completionDate time.Time) error {
-	publication, found, err := s.fetchOne(ctx, selectForArchiveStatement, id.String())
+// archive moves the publication into the archive table inside one transaction,
+// so a dispatcher fenced out between the read and the delete leaves no early
+// archive copy behind: the rollback discards the copy, the source row stays
+// with the current holder, and the eventual real completion writes the archive
+// entry under the generation that actually settled the publication.
+func (s *sqlStore) archive(
+	ctx context.Context, id uuid.UUID, attempts int, completionDate time.Time,
+) (settled bool, err error) {
+	tx, err := s.database.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("archive publication %s: read: %w", id, err)
+		return false, fmt.Errorf("archive publication %s: begin transaction: %w", id, err)
+	}
+	defer func(tx *sql.Tx) {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			err = errors.Join(err, fmt.Errorf("archive publication %s: rollback: %w", id, rollbackErr))
+		}
+	}(tx)
+
+	publication, found, err := s.fetchOne(ctx, tx, selectForArchiveStatement,
+		id.String(), string(StatusProcessing), int64(attempts))
+	if err != nil {
+		return false, fmt.Errorf("archive publication %s: read: %w", id, err)
 	}
 	if !found {
-		return nil
+		return false, nil
 	}
 
-	_, err = s.exec(ctx, s.database, insertArchiveStatement,
+	_, err = s.exec(ctx, tx, insertArchiveStatement,
 		publication.ID.String(),
 		string(publication.ListenerID),
 		publication.EventType,
@@ -270,49 +321,56 @@ func (s *sqlStore) archive(ctx context.Context, id uuid.UUID, completionDate tim
 		nullableTime(publication.LastResubmissionDate),
 	)
 	if err != nil {
-		return fmt.Errorf("archive publication %s: write archive entry: %w", id, err)
+		return false, fmt.Errorf("archive publication %s: write archive entry: %w", id, err)
 	}
 
-	if _, err := s.exec(ctx, s.database, deletePublicationStatement, id.String()); err != nil {
-		return fmt.Errorf("archive publication %s: delete source row: %w", id, err)
-	}
-	return nil
-}
-
-// MarkResubmitted transitions a publication back into delivery, counting the
-// attempt. It reports false when another caller resubmitted or settled the
-// publication first: the update re-checks both the status and the attempt
-// counter it read, so two concurrent resubmissions of the same entry can never
-// both succeed, regardless of statement interleaving.
-func (s *sqlStore) MarkResubmitted(
-	ctx context.Context,
-	id uuid.UUID,
-	resubmissionDate time.Time,
-) (bool, error) {
-	rows, err := s.query(ctx, s.database, selectAttemptsStatement,
-		id.String(), string(StatusResubmitted), string(StatusCompleted))
+	result, err := s.exec(ctx, tx, deleteProcessingStatement,
+		id.String(), string(StatusProcessing), int64(attempts))
 	if err != nil {
-		return false, fmt.Errorf("mark publication %s as resubmitted: read: %w", id, err)
-	}
-	attempts, found, err := scanAttempts(rows)
-	if err != nil {
-		return false, fmt.Errorf("mark publication %s as resubmitted: read: %w", id, err)
-	}
-	if !found {
-		return false, nil
-	}
-
-	result, err := s.exec(ctx, s.database, markResubmittedStatement,
-		string(StatusResubmitted), attempts+1, formatTime(resubmissionDate),
-		id.String(), string(StatusResubmitted), string(StatusCompleted), attempts)
-	if err != nil {
-		return false, fmt.Errorf("mark publication %s as resubmitted: write: %w", id, err)
+		return false, fmt.Errorf("archive publication %s: delete source row: %w", id, err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("mark publication %s as resubmitted: inspect: %w", id, err)
+		return false, fmt.Errorf("archive publication %s: inspect source deletion: %w", id, err)
 	}
-	return affected > 0, nil
+	if affected == 0 {
+		return false, nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("archive publication %s: commit: %w", id, err)
+	}
+	return true, nil
+}
+
+// MarkResubmitted transitions a published, processing, or failed publication of
+// the given attempt generation back into delivery, counting the attempt. It
+// reports false when another caller resubmitted or settled the publication
+// first: the compare-and-set re-checks the status and the attempt counter the
+// caller observed, so the staleness decision made against that observation
+// cannot be applied to a row that has moved on in the meantime, and two
+// concurrent resubmissions of the same entry can never both succeed.
+func (s *sqlStore) MarkResubmitted(
+	ctx context.Context,
+	id uuid.UUID,
+	attempts int,
+	resubmissionDate time.Time,
+) (int, bool, error) {
+	result, err := s.exec(ctx, s.database, markResubmittedStatement,
+		string(StatusResubmitted), int64(attempts+1), formatTime(resubmissionDate),
+		id.String(), string(StatusPublished), string(StatusProcessing), string(StatusFailed),
+		int64(attempts))
+	if err != nil {
+		return 0, false, fmt.Errorf("mark publication %s as resubmitted: %w", id, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, false, fmt.Errorf("mark publication %s as resubmitted: inspect: %w", id, err)
+	}
+	if affected == 0 {
+		return 0, false, nil
+	}
+	return attempts + 1, true, nil
 }
 
 // FindIncomplete returns every publication not yet completed, in publication
@@ -322,8 +380,9 @@ func (s *sqlStore) FindIncomplete(ctx context.Context) ([]Publication, error) {
 	return s.collect(rows, err)
 }
 
-// FindIncompletePublishedBefore returns every publication not yet completed that
-// was published before the reference time, in publication order.
+// FindIncompletePublishedBefore returns every publication not yet completed
+// whose latest delivery attempt started before the reference time, in
+// publication order.
 func (s *sqlStore) FindIncompletePublishedBefore(
 	ctx context.Context,
 	reference time.Time,
@@ -333,13 +392,16 @@ func (s *sqlStore) FindIncompletePublishedBefore(
 	return s.collect(rows, err)
 }
 
-func (s *sqlStore) collect(rows *sql.Rows, queryErr error) ([]Publication, error) {
+func (s *sqlStore) collect(rows *sql.Rows, queryErr error) (publications []Publication, err error) {
 	if queryErr != nil {
 		return nil, fmt.Errorf("find incomplete publications: %w", queryErr)
 	}
-	defer rows.Close()
+	defer func(rows *sql.Rows) {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("find incomplete publications: close rows: %w", closeErr))
+		}
+	}(rows)
 
-	var publications []Publication
 	for rows.Next() {
 		publication, err := scanPublication(rows)
 		if err != nil {
@@ -354,35 +416,27 @@ func (s *sqlStore) collect(rows *sql.Rows, queryErr error) ([]Publication, error
 }
 
 // fetchOne reads at most one publication, fully consuming and closing the rows
-// before returning so a follow-up statement can run on the same database.
+// before returning so a follow-up statement can run on the same connection.
 func (s *sqlStore) fetchOne(
-	ctx context.Context, statement string, args ...any,
-) (Publication, bool, error) {
-	rows, err := s.query(ctx, s.database, statement, args...)
+	ctx context.Context, querier Querier, statement string, args ...any,
+) (publication Publication, found bool, err error) {
+	rows, err := s.query(ctx, querier, statement, args...)
 	if err != nil {
 		return Publication{}, false, err
 	}
-	defer rows.Close()
+	defer func(rows *sql.Rows) {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close rows: %w", closeErr))
+		}
+	}(rows)
 	if !rows.Next() {
 		return Publication{}, false, rows.Err()
 	}
-	publication, err := scanPublication(rows)
+	publication, err = scanPublication(rows)
 	if err != nil {
 		return Publication{}, false, err
 	}
 	return publication, true, nil
-}
-
-func scanAttempts(rows *sql.Rows) (int64, bool, error) {
-	defer rows.Close()
-	if !rows.Next() {
-		return 0, false, rows.Err()
-	}
-	var attempts int64
-	if err := rows.Scan(&attempts); err != nil {
-		return 0, false, err
-	}
-	return attempts, true, nil
 }
 
 func scanPublication(rows *sql.Rows) (Publication, error) {
@@ -432,8 +486,14 @@ func scanPublication(rows *sql.Rows) (Publication, error) {
 	}, nil
 }
 
+// timeLayout renders timestamps in UTC with a fixed-width, nine-digit
+// fraction, so the lexicographic order of the stored TEXT values equals their
+// chronological order. The incomplete-before filter compares dates inside SQL,
+// which would misorder the variable-width RFC3339Nano rendering.
+const timeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
 func formatTime(value time.Time) string {
-	return value.UTC().Format(time.RFC3339Nano)
+	return value.UTC().Format(timeLayout)
 }
 
 func parseTime(value string) (time.Time, error) {

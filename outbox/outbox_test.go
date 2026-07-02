@@ -304,6 +304,12 @@ func TestFailedDeliveryStaysIncompleteAndIsResubmitted(t *testing.T) {
 	if incomplete[0].Status != StatusFailed {
 		t.Errorf("status after failure = %s, want %s", incomplete[0].Status, StatusFailed)
 	}
+	if got := incomplete[0].CompletionAttempts; got != 1 {
+		t.Errorf("completion attempts after the initial dispatch = %d, want 1", got)
+	}
+	if incomplete[0].LastResubmissionDate == nil {
+		t.Error("last resubmission date not seeded at creation")
+	}
 
 	if err := f.registry.ResubmitIncomplete(t.Context(), 0); err != nil {
 		t.Fatalf("resubmit incomplete: %v", err)
@@ -352,8 +358,10 @@ func TestResubmissionCountsAttemptsAndRestoresTheEventFromItsSerializedForm(t *t
 	if len(incomplete) != 1 {
 		t.Fatalf("incomplete publications = %d, want 1", len(incomplete))
 	}
-	if got := incomplete[0].CompletionAttempts; got != 1 {
-		t.Errorf("completion attempts = %d, want 1", got)
+	// The initial dispatch counts as attempt one and the resubmission as
+	// attempt two, mirroring the Spring Modulith attempt accounting.
+	if got := incomplete[0].CompletionAttempts; got != 2 {
+		t.Errorf("completion attempts = %d, want 2", got)
 	}
 	if incomplete[0].LastResubmissionDate == nil {
 		t.Error("last resubmission date not recorded")
