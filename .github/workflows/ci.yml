@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [transaction, eventbus, logging, conf]
+        module: [transaction, eventbus, logging]
     steps:
       - uses: actions/checkout@v4
       - name: assert go.mod has no require directive
@@ -51,6 +51,23 @@ jobs:
             exit 1
           fi
           echo "${{ matrix.module }}: zero-dependency core OK"
+
+  conf-single-dependency:
+    name: conf confined to jsonschema-go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: conf/go.mod
+      - name: assert conf requires only google/jsonschema-go
+        run: |
+          extra="$(go mod edit -json conf/go.mod | jq -r '.Require[]?.Path' | grep -v '^github.com/google/jsonschema-go$' || true)"
+          if [ -n "$extra" ]; then
+            echo "::error::conf/go.mod must require only github.com/google/jsonschema-go; found: $extra"
+            exit 1
+          fi
+          echo "conf: single-dependency (jsonschema-go) OK"
 
   goway-isolation:
     name: goway confined to the adapter
