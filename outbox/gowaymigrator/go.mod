@@ -3,14 +3,14 @@ module github.com/cgardev/gokeel/outbox/gowaymigrator
 go 1.26.3
 
 require (
-	github.com/cgardev/gokeel/outbox v0.0.0-00010101000000-000000000000
+	github.com/cgardev/gokeel/outbox v0.0.0-20260703104738-2c7d202df10e
 	github.com/cgardev/goway v0.0.0-20260531141847-626204f558ed
 	modernc.org/sqlite v1.52.0
 )
 
 require (
-	github.com/cgardev/gokeel/eventbus v0.0.0-00010101000000-000000000000 // indirect
-	github.com/cgardev/gokeel/transaction v0.0.0-00010101000000-000000000000 // indirect
+	github.com/cgardev/gokeel/eventbus v0.0.0-20260703104738-2c7d202df10e // indirect
+	github.com/cgardev/gokeel/transaction v0.0.0-20260703104738-2c7d202df10e // indirect
 	github.com/cgardev/gooq v0.0.0-20260531151630-ef8fc4b12d37 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
