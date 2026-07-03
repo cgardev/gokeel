@@ -20,18 +20,19 @@ The repository is a single project published as several independent Go modules,
 so you take only the pieces you need and your dependency graph stays as small as
 the part you import.
 
-| Module | Import path | What it does | Third-party dependencies |
-| --- | --- | --- | --- |
-| **transaction** | `github.com/cgardev/gokeel/transaction` | A context-bound, declarative transaction manager over `database/sql` with Spring-style propagation and commit synchronizations. | **None** — standard library only. |
-| **eventbus** | `github.com/cgardev/gokeel/eventbus` | A small, synchronous, in-process event bus with per-listener delivery. | **None** — standard library only. |
-| **logging** | `github.com/cgardev/gokeel/logging` | Spring Boot-style hierarchical log levels for `log/slog`: per-package and per-type levels, externally overridable and adjustable at runtime. | **None** — standard library only. |
-| **conf** | `github.com/cgardev/gokeel/conf` | Externalized configuration from layered JSON documents: `${VAR:default}` placeholders resolved from the environment, relaxed struct binding, and a generated JSON Schema for editor completion. | **None** — standard library only. |
-| **outbox** | `github.com/cgardev/gokeel/outbox` | The transactional outbox pattern as an in-process event publication registry: events are written in the producing transaction and delivered after commit. | `transaction`, `eventbus`, `google/uuid`. |
-| **sqlbus** | `github.com/cgardev/gokeel/sqlbus` | The eventbus extended across application nodes, with a shared SQL database (PostgreSQL or SQLite) as the only transport: competing listeners handle each event once cluster-wide, broadcast listeners once per node. | `transaction`, `eventbus`, `google/uuid`. |
+| Module | Import path | What it does | Third-party dependencies | Reference |
+| --- | --- | --- | --- | --- |
+| **transaction** | `github.com/cgardev/gokeel/transaction` | A context-bound, declarative transaction manager over `database/sql` with Spring-style propagation and commit synchronizations. | **None** — standard library only. | [![Go Reference](https://pkg.go.dev/badge/github.com/cgardev/gokeel/transaction.svg)](https://pkg.go.dev/github.com/cgardev/gokeel/transaction) |
+| **eventbus** | `github.com/cgardev/gokeel/eventbus` | A small, synchronous, in-process event bus with per-listener delivery. | **None** — standard library only. | [![Go Reference](https://pkg.go.dev/badge/github.com/cgardev/gokeel/eventbus.svg)](https://pkg.go.dev/github.com/cgardev/gokeel/eventbus) |
+| **logging** | `github.com/cgardev/gokeel/logging` | Spring Boot-style hierarchical log levels for `log/slog`: per-package and per-type levels, externally overridable and adjustable at runtime. | **None** — standard library only. | [![Go Reference](https://pkg.go.dev/badge/github.com/cgardev/gokeel/logging.svg)](https://pkg.go.dev/github.com/cgardev/gokeel/logging) |
+| **conf** | `github.com/cgardev/gokeel/conf` | Externalized configuration from layered JSON documents: `${VAR:default}` placeholders resolved from the environment, relaxed struct binding, and a generated JSON Schema for editor completion. | `google/jsonschema-go`. | [![Go Reference](https://pkg.go.dev/badge/github.com/cgardev/gokeel/conf.svg)](https://pkg.go.dev/github.com/cgardev/gokeel/conf) |
+| **outbox** | `github.com/cgardev/gokeel/outbox` | The transactional outbox pattern as an in-process event publication registry: events are written in the producing transaction and delivered after commit. | `transaction`, `eventbus`, `google/uuid`. | [![Go Reference](https://pkg.go.dev/badge/github.com/cgardev/gokeel/outbox.svg)](https://pkg.go.dev/github.com/cgardev/gokeel/outbox) |
+| **sqlbus** | `github.com/cgardev/gokeel/sqlbus` | The eventbus extended across application nodes, with a shared SQL database (PostgreSQL or SQLite) as the only transport: competing listeners handle each event once cluster-wide, broadcast listeners once per node. | `transaction`, `eventbus`, `google/uuid`. | [![Go Reference](https://pkg.go.dev/badge/github.com/cgardev/gokeel/sqlbus.svg)](https://pkg.go.dev/github.com/cgardev/gokeel/sqlbus) |
 
-`transaction`, `eventbus`, `logging`, and `conf` are leaves: each is
-its own module with a `go.mod` that has **no `require` directive at all**, a
-property enforced in CI. `outbox` and `sqlbus` sit on top and compose
+`transaction`, `eventbus`, `logging`, and `conf` are leaves. The first three
+have a `go.mod` with **no `require` directive at all**, and `conf` carries
+exactly one dependency, `google/jsonschema-go`, for schema generation — both
+properties enforced in CI. `outbox` and `sqlbus` sit on top and compose
 `transaction` and `eventbus`: the outbox guarantees that the listeners of one
 process eventually handle an event, while sqlbus carries events to listeners
 attached on other nodes. Route an event type through one of them, never both.
