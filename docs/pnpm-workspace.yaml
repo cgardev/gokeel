@@ -1,0 +1,5 @@
+# sharp and esbuild ship native binaries whose installation scripts pnpm blocks
+# by default; approving them here keeps installs non-interactive, also in CI.
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
