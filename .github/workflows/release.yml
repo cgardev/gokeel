@@ -66,6 +66,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           scripts/pin.sh
+      # Requesting each module from the public proxy is what makes pkg.go.dev
+      # index it; nothing is published there otherwise. A failed request is a
+      # warning rather than an error so a private repository does not fail CI.
+      - name: request indexing on the Go module proxy
+        if: steps.mode.outputs.tagged == 'false'
+        run: |
+          for module in transaction eventbus logging conf outbox outbox/gowaymigrator sqlbus sqlbus/gowaymigrator; do
+            if curl -sSf "https://proxy.golang.org/github.com/cgardev/gokeel/$module/@latest"; then
+              echo " <= requested $module"
+            else
+              echo "::warning::proxy request for $module failed; is the repository public?"
+            fi
+          done
 
   release:
     name: tagged release
@@ -86,3 +99,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           scripts/release.sh "$VERSION"
+      - name: request indexing on the Go module proxy
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          for module in transaction eventbus logging conf outbox outbox/gowaymigrator sqlbus sqlbus/gowaymigrator; do
+            if curl -sSf "https://proxy.golang.org/github.com/cgardev/gokeel/$module/@v/$VERSION.info"; then
+              echo " <= requested $module@$VERSION"
+            else
+              echo "::warning::proxy request for $module@$VERSION failed"
+            fi
+          done
