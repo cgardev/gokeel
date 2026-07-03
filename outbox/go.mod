@@ -3,8 +3,9 @@ module github.com/cgardev/gokeel/outbox
 go 1.26.3
 
 require (
-	github.com/cgardev/gokeel/eventbus v0.0.0-00010101000000-000000000000
-	github.com/cgardev/gokeel/transaction v0.0.0-00010101000000-000000000000
+	github.com/cgardev/gokeel/eventbus v0.0.0-20260703101859-181db0fd273f
+	github.com/cgardev/gokeel/transaction v0.0.0-20260703101859-181db0fd273f
+	github.com/cgardev/gooq v0.0.0-20260531151630-ef8fc4b12d37
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/testcontainers/testcontainers-go v0.42.0
@@ -18,7 +19,6 @@ require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cgardev/gooq v0.0.0-20260531151630-ef8fc4b12d37 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
