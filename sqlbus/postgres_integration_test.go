@@ -226,9 +226,12 @@ func testFailureAndResubmission(t *testing.T, database *sql.DB) {
 
 func resetPostgresSchema(t *testing.T, database *sql.DB) {
 	t.Helper()
+	// The native record table must fall with the data tables: if it survives,
+	// the migrator considers every script applied and skips rebuilding the
+	// schema on the next Initialize.
 	_, err := database.ExecContext(t.Context(), "DROP TABLE IF EXISTS "+
 		messageTableName+", "+listenerTableName+", "+consumerTableName+", "+
-		deliveryTableName+", "+SchemaHistoryTable)
+		deliveryTableName+", "+SchemaHistoryTable+", "+nativeAppliedTable)
 	if err != nil {
 		t.Fatalf("reset schema: %v", err)
 	}
