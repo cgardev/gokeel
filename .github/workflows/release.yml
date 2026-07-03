@@ -1,0 +1,88 @@
+name: Release
+
+# Two publication modes, mirroring the two scripts under scripts/:
+#
+# * pin — runs automatically on every push to main that touches a module, while
+#   the repository has no tags. It executes scripts/pin.sh so the intra-repository
+#   require directives always point at resolvable pseudo-versions and every module
+#   stays consumable with `go get ...@latest` (the tagless mode gooq uses).
+#
+# * release — runs only when dispatched manually with a version input. It executes
+#   scripts/release.sh to cut a lockstep tagged release of the whole family.
+#
+# The commits and tags the scripts push use the workflow's GITHUB_TOKEN; pushes
+# made with that token do not trigger new workflow runs, so the pin job cannot
+# retrigger itself.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - transaction/**
+      - eventbus/**
+      - logging/**
+      - conf/**
+      - outbox/**
+      - sqlbus/**
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, in the form vX.Y.Z"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  pin:
+    name: pin pseudo-versions
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: skip once the family has tagged releases
+        id: mode
+        run: |
+          if [ -n "$(git tag --list)" ]; then
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+            echo "tags exist; the tagless pin mode no longer applies"
+          else
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-go@v5
+        if: steps.mode.outputs.tagged == 'false'
+        with:
+          go-version-file: outbox/go.mod
+      - name: pin intra-repository requires to main
+        if: steps.mode.outputs.tagged == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/pin.sh
+
+  release:
+    name: tagged release
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: outbox/go.mod
+      - name: release the family at ${{ inputs.version }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/release.sh "$VERSION"
